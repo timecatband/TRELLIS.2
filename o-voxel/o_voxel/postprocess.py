@@ -298,21 +298,51 @@ def to_glb(
     if verbose:
         print("Finalizing mesh...", end='', flush=True)
     
+    _log("start_finalizing")
+    # Helpful debug prints (only when verbose)
+    if verbose:
+        try:
+            print(f"attrs.shape={tuple(attrs.shape)}, texture_size={texture_size}")
+            print(f"attr_layout keys={list(attr_layout.keys())}")
+        except Exception:
+            pass
+
     mask = mask.cpu().numpy()
-    
+    if verbose:
+        print(f"mask pixels: {np.count_nonzero(mask)} / {mask.size}")
+    _log("mask_converted")
+
     # Extract channels based on layout (BaseColor, Metallic, Roughness, Alpha)
+    _log("extract_channels_start")
     base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha_mode = 'OPAQUE'
-    
+    _log("extract_channels_done")
+    if verbose:
+        print(f"channel shapes: base_color={base_color.shape}, metallic={metallic.shape}, roughness={roughness.shape}, alpha={alpha.shape}")
+
     # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
     mask_inv = (~mask).astype(np.uint8)
+    if verbose:
+        print(f"mask_inv nonzero: {mask_inv.sum()}")
+
+    _log("before_inpaint_base_color")
     base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+    _log("after_inpaint_base_color")
+
+    _log("before_inpaint_metallic")
     metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    _log("after_inpaint_metallic")
+
+    _log("before_inpaint_roughness")
     roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    _log("after_inpaint_roughness")
+
+    _log("before_inpaint_alpha")
     alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    _log("after_inpaint_alpha")
     
     # Create PBR material
     # Standard PBR packs Metallic and Roughness into Blue and Green channels
