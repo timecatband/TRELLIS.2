@@ -6,6 +6,7 @@ import cv2
 from PIL import Image
 import trimesh
 import trimesh.visual
+import time
 from flex_gemm.ops.grid_sample import grid_sample_3d
 import nvdiffrast.torch as dr
 import cumesh
@@ -58,6 +59,15 @@ def to_glb(
         use_tqdm: whether to use tqdm to display progress bar
     """
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
+    # Timing helpers
+    t0 = time.perf_counter()
+    t_prev = t0
+    def _log(stage: str):
+        nonlocal t_prev
+        now = time.perf_counter()
+        print(f"[to_glb] {stage}: {now - t_prev:.3f}s (step), {now - t0:.3f}s (total)")
+        t_prev = now
+
     if isinstance(aabb, (list, tuple)):
         aabb = np.array(aabb)
     if isinstance(aabb, np.ndarray):
@@ -91,11 +101,15 @@ def to_glb(
     assert voxel_size.dim() == 1 and voxel_size.size(0) == 3
     assert isinstance(grid_size, torch.Tensor)
     assert grid_size.dim() == 1 and grid_size.size(0) == 3
+    _log("input_normalization")
     
     if use_tqdm:
         pbar = tqdm(total=6, desc="Extracting GLB")
     if verbose:
         print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
+
+    # Start timing the heavy operations
+    _log("starting")
 
     # Move data to GPU
     vertices = vertices.cuda()
@@ -104,6 +118,7 @@ def to_glb(
     # Initialize CUDA mesh handler
     mesh = cumesh.CuMesh()
     mesh.init(vertices, faces)
+    _log("mesh_init")
     
     # --- Initial Mesh Cleaning ---
     # Fills holes as much as we can before processing
@@ -111,6 +126,7 @@ def to_glb(
     if verbose:
         print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
     vertices, faces = mesh.read()
+    _log("initial_fill_and_read")
     if use_tqdm:
         pbar.update(1)
         
@@ -124,6 +140,7 @@ def to_glb(
         pbar.update(1)
     if verbose:
         print("Done")
+    _log("bvh_build")
         
     if use_tqdm:
         pbar.set_description("Cleaning mesh")
@@ -180,16 +197,19 @@ def to_glb(
         ))
         if verbose:
             print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+        _log("remesh_complete")
         
         # Simplify and clean the remeshed result (similar logic to above)
         mesh.simplify(decimation_target, verbose=verbose)
         if verbose:
             print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+        _log("remesh_simplify")
     
     if use_tqdm:
         pbar.update(1)
     if verbose:
         print("Done")
+    _log("simplify_or_remesh_finished")
         
     
     # --- UV Parameterization ---
@@ -214,6 +234,7 @@ def to_glb(
     out_vmaps = out_vmaps.cuda()
     mesh.compute_vertex_normals()
     out_normals = mesh.read_vertex_normals()[out_vmaps]
+    _log("uv_unwrap_and_normals")
     
     if use_tqdm:
         pbar.update(1)
@@ -241,6 +262,7 @@ def to_glb(
         mask_chunk = rast_chunk[..., 3:4] > 0
         rast_chunk[..., 3:4] += i # Store face ID in alpha channel
         rast = torch.where(mask_chunk, rast_chunk, rast)
+    _log("rasterize_loop")
     
     # Mask of valid pixels in texture
     mask = rast[0, ..., 3] > 0
@@ -264,6 +286,7 @@ def to_glb(
         grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
         mode='trilinear',
     )
+    _log("attribute_sampling")
     if use_tqdm:
         pbar.update(1)
     if verbose:
@@ -321,11 +344,13 @@ def to_glb(
         process=False,
         visual=trimesh.visual.TextureVisuals(uv=uvs_np, material=material)
     )
+    _log("material_and_mesh_build")
     
     if use_tqdm:
         pbar.update(1)
         pbar.close()
     if verbose:
         print("Done")
+    _log("complete")
     
     return textured_mesh
