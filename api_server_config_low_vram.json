@@ -1,0 +1,33 @@
+{
+  "_comment": "TRELLIS 2 API Server - Low VRAM Configuration",
+  "_description": "Optimized for systems with limited VRAM. ~4-5GB VRAM.",
+  "_optimizations": [
+    "Fast 512 pipeline",
+    "Reduced token count (24576)",
+    "Lower texture resolution (2048)",
+    "Smaller decimation target (500K faces)"
+  ],
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8082,
+    "log_level": "info"
+  },
+  "model": {
+    "model_path": "microsoft/TRELLIS.2-4B",
+    "device": "cuda"
+  },
+  "generation": {
+    "seed": 42,
+    "pipeline_type": "512",
+    "max_num_tokens": 24576
+  },
+  "export": {
+    "glb_decimation_target": 500000,
+    "glb_texture_size": 2048
+  },
+  "worker": {
+    "limit_model_concurrency": 5,
+    "job_cleanup_interval_seconds": 300,
+    "job_max_age_seconds": 3600
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "_comment": "TRELLIS 2 API Server - High Quality Configuration",
+  "_description": "Maximum quality output. Requires high-end GPU. ~12-16GB VRAM.",
+  "_features": [
+    "1536 cascade pipeline for highest resolution",
+    "Maximum token count (65536)",
+    "High texture resolution (8192)",
+    "Double face count (2M faces)",
+    "Reduced concurrency (2) for stability"
+  ],
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8082,
+    "log_level": "info"
+  },
+  "model": {
+    "model_path": "microsoft/TRELLIS.2-4B",
+    "device": "cuda"
+  },
+  "generation": {
+    "seed": 42,
+    "pipeline_type": "1536_cascade",
+    "max_num_tokens": 65536
+  },
+  "export": {
+    "glb_decimation_target": 2000000,
+    "glb_texture_size": 8192
+  },
+  "worker": {
+    "limit_model_concurrency": 2,
+    "job_cleanup_interval_seconds": 300,
+    "job_max_age_seconds": 3600
+  }
+}

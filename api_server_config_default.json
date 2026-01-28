@@ -1,0 +1,31 @@
+{
+  "_comment": "TRELLIS 2 API Server - Default Configuration",
+  "_description": "Balanced quality and performance. Good for most use cases. ~9GB VRAM.",
+  "_see_also": [
+    "api_server_config_low_vram.json - For systems with limited VRAM",
+    "api_server_config_high_quality.json - For maximum quality output"
+  ],
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8082,
+    "log_level": "info"
+  },
+  "model": {
+    "model_path": "microsoft/TRELLIS.2-4B",
+    "device": "cuda"
+  },
+  "generation": {
+    "seed": 42,
+    "pipeline_type": "1024_cascade",
+    "max_num_tokens": 49152
+  },
+  "export": {
+    "glb_decimation_target": 1000000,
+    "glb_texture_size": 4096
+  },
+  "worker": {
+    "limit_model_concurrency": 5,
+    "job_cleanup_interval_seconds": 300,
+    "job_max_age_seconds": 3600
+  }
+}
