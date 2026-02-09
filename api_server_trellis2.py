@@ -532,7 +532,7 @@ class Trellis2Worker:
             glb = o_voxel.postprocess.to_glb(
                 vertices=textured_mesh.vertices,
                 faces=textured_mesh.faces,
-                attr_volume=textured_mesh.attrs,
+                attr_volume=textured_mesh.attrs.detach(),
                 coords=textured_mesh.coords,
                 attr_layout=textured_mesh.layout,
                 voxel_size=textured_mesh.voxel_size,
