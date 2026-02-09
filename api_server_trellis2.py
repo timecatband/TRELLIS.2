@@ -432,15 +432,16 @@ class Trellis2Worker:
         logger.info(f"[{uid}] Shape generated and saved to {shape_output_path}")
         
         # Store intermediate data for texture generation
+        # Move to CPU to save VRAM
         self.job_tracker.update_job(
             image_hash,
             status='texture_processing',
             shape_path=shape_output_path,
-            shape_slat=shape_slat,
-            subs=subs,
-            meshes=meshes,
+            shape_slat=shape_slat.cpu(),
+            subs=[sub.cpu() for sub in subs],
+            meshes=[mesh.cpu() for mesh in meshes],
             resolution=res,
-            conditioning=conditioning,
+            conditioning={k: v.cpu() for k, v in conditioning.items()},
         )
         
         return shape_output_path
@@ -454,11 +455,12 @@ class Trellis2Worker:
                 logger.error(f"[{uid}] Job not found for texture generation")
                 return
             
-            shape_slat = job['shape_slat']
-            subs = job['subs']
-            meshes = job['meshes']
+            # Retrieve and move back to GPU
+            shape_slat = job['shape_slat'].to(self.device)
+            subs = [sub.to(self.device) for sub in job['subs']]
+            meshes = [mesh.to(self.device) for mesh in job['meshes']]
             res = job['resolution']
-            conditioning = job['conditioning']
+            conditioning = {k: v.to(self.device) for k, v in job['conditioning'].items()}
             
             # Get texture parameters
             tex_guidance_scale = params.get('tex_guidance_scale', 7.5)
@@ -493,8 +495,18 @@ class Trellis2Worker:
                     }
                 )
             
+            # Cleanup shape_slat and conditioning
+            del shape_slat
+            del conditioning
+            torch.cuda.empty_cache()
+
             # Decode texture
             tex_voxels = self.pipeline.decode_tex_slat(tex_slat, subs)
+            
+            # Cleanup tex_slat and subs
+            del tex_slat
+            del subs
+            torch.cuda.empty_cache()
             
             # Combine mesh with texture voxels
             mesh = meshes[0]
