@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import logging.handlers
+import queue
 import signal
 import sys
 import tempfile
@@ -203,12 +204,118 @@ class Trellis2Worker:
         
         logger.info(f'Total model loading time: {time.time() - total_start_time:.2f} seconds')
 
-    def get_queue_length(self):
-        if model_semaphore is None:
-            return 0
+        # Request Queue for sequential processing
+        self.request_queue = []
+        self.queue_lock = threading.Lock()
+        self.queue_cond = threading.Condition(self.queue_lock)
+        
+        # Start worker thread
+        threading.Thread(target=self._worker_loop, daemon=True).start()
+
+    def _safe_set_result(self, future, result):
+        if not future.done():
+            future.get_loop().call_soon_threadsafe(future.set_result, result)
+
+    def _safe_set_exception(self, future, exception):
+        if not future.done():
+            future.get_loop().call_soon_threadsafe(future.set_exception, exception)
+
+    def _check_queue_for_unblocking(self, image_hash, shape_path):
+        """Check queue for redundant jobs and unblock them"""
+        with self.queue_lock:
+             to_remove = []
+             for item in self.request_queue:
+                 if item['image_hash'] == image_hash:
+                     logger.info(f"Unblocking queued job {item['uid']} (redundant request)")
+                     self._safe_set_result(item['shape_future'], (shape_path, image_hash))
+                     to_remove.append(item)
+             for item in to_remove:
+                 self.request_queue.remove(item)
+
+    def _worker_loop(self):
+        logger.info(f"Worker {self.worker_id} loop started")
+        while True:
+            with self.queue_cond:
+                while not self.request_queue:
+                    self.queue_cond.wait()
+                job_data = self.request_queue.pop(0)
+            
+            uid = job_data['uid']
+            image_hash = job_data['image_hash']
+            params = job_data['params']
+            shape_future = job_data['shape_future']
+            
+            # Check cache before processing (when exiting queue)
+            job = self.job_tracker.get_job(image_hash)
+            if job and job['status'] == 'completed' and job.get('shape_path') and os.path.exists(job['shape_path']):
+                logger.info(f"[{uid}] Found cached result after dequeue")
+                self._safe_set_result(shape_future, (job['shape_path'], image_hash))
+                continue
+
+            try:
+                # 1. Generate Shape
+                # Ensure job entry exists (it might have been created by submit_request)
+                if not job: # Should have been created
+                     self.job_tracker.create_job(image_hash, uid)
+
+                shape_path = self._generate_shape_impl(uid, image_hash, params)
+                
+                # Unblock the API waiter
+                self._safe_set_result(shape_future, (shape_path, image_hash))
+                
+                # 2. Generate Texture
+                self._generate_texture_impl(uid, image_hash, params)
+                
+                # 3. Check queue for unblocking
+                self._check_queue_for_unblocking(image_hash, shape_path)
+                
+            except Exception as e:
+                logger.error(f"[{uid}] Worker Loop Error: {e}")
+                traceback.print_exc()
+                self._safe_set_exception(shape_future, e)
+                self.job_tracker.update_job(image_hash, status='error', error=str(e))
+
+    async def submit_request(self, uid: str, params: dict) -> tuple[str, str]:
+        # Handle image loading and hashing here to check cache
+        if 'image' in params:
+            # We need to replicate load_image_from_base64 here or pass the raw string
+            # params['image'] is base64 string
+            img = load_image_from_base64(params['image'])
+            image_hash = compute_image_hash(img)
         else:
-            return self.limit_model_concurrency - model_semaphore._value + (len(
-                model_semaphore._waiters) if model_semaphore._waiters is not None else 0)
+            raise ValueError("No image provided")
+
+        # Check Cache before joining queue
+        job = self.job_tracker.get_job(image_hash)
+        if job:
+            if job['status'] == 'completed' or (job.get('shape_path') and os.path.exists(job['shape_path'])):
+                 logger.info(f"[{uid}] returning cached result immediately")
+                 return job['shape_path'], image_hash
+        
+        # If not cached, enqueue
+        loop = asyncio.get_running_loop()
+        shape_future = loop.create_future()
+        
+        # Create job entry (so status is tracked)
+        # Note: multiple requests might overwrite this, but they have same hash/content, so it's fine.
+        # But we update uid to latest? Or keep first?
+        # If we keep first, logging uses first uid.
+        if not job:
+            self.job_tracker.create_job(image_hash, uid)
+        
+        logger.info(f"[{uid}] Enqueuing request (Queue length: {len(self.request_queue)})")
+        with self.queue_cond:
+            self.request_queue.append({
+                'uid': uid,
+                'image_hash': image_hash,
+                'params': params,
+                'shape_future': shape_future
+            })
+            self.queue_cond.notify()
+            
+        return await shape_future
+    def get_queue_length(self):
+        return len(self.request_queue)
 
     def get_status(self):
         return {
@@ -217,154 +324,130 @@ class Trellis2Worker:
         }
 
     @torch.inference_mode()
-    def generate_shape(self, uid: str, params: dict) -> tuple[str, str]:
-        """
-        Generate shape (geometry only).
-        Returns (shape_glb_path, image_hash).
-        Starts texture generation in background.
-        """
-        # Load image
+    def _generate_shape_impl(self, uid: str, image_hash: str, params: dict) -> str:
+        """Internal implementation of shape generation."""
+        # Load image (from params base64 just for processing, hash is already computed)
         if 'image' in params:
-            image = params["image"]
-            image = load_image_from_base64(image)
+            image = load_image_from_base64(params["image"])
         else:
             raise ValueError("No image provided")
         
-        # Compute image hash for job tracking
-        image_hash = compute_image_hash(image)
+        # Preprocess image
+        image = self.pipeline.preprocess_image(image)
         
-        # Create job
-        self.job_tracker.create_job(image_hash, uid)
+        # Get parameters
+        seed = params.get("seed", self.seed)
+        ss_guidance_scale = params.get('ss_guidance_scale', 7.5)
+        ss_sampling_steps = params.get('ss_sampling_steps', 12)
+        shape_guidance_scale = params.get('shape_guidance_scale', 7.5)
+        shape_sampling_steps = params.get('shape_sampling_steps', 12)
         
-        try:
-            # Preprocess image
-            image = self.pipeline.preprocess_image(image)
-            
-            # Get parameters
-            seed = params.get("seed", self.seed)
-            ss_guidance_scale = params.get('ss_guidance_scale', 7.5)
-            ss_sampling_steps = params.get('ss_sampling_steps', 12)
-            shape_guidance_scale = params.get('shape_guidance_scale', 7.5)
-            shape_sampling_steps = params.get('shape_sampling_steps', 12)
-            
-            logger.info(f"[{uid}] Generating shape with seed={seed}")
-            
-            # Get conditioning
-            torch.manual_seed(seed)
-            cond_512 = self.pipeline.get_cond([image], 512)
-            cond_1024 = None
-            if self.pipeline_type != '512':
-                cond_1024 = self.pipeline.get_cond([image], 1024)
-            
-            # Combine conditioning
-            conditioning = {
-                'cond_512': cond_512['cond'],
-                'neg_cond': cond_512['neg_cond'],
+        logger.info(f"[{uid}] Generating shape with seed={seed}")
+        
+        # Get conditioning
+        torch.manual_seed(seed)
+        cond_512 = self.pipeline.get_cond([image], 512)
+        cond_1024 = None
+        if self.pipeline_type != '512':
+            cond_1024 = self.pipeline.get_cond([image], 1024)
+        
+        # Combine conditioning
+        conditioning = {
+            'cond_512': cond_512['cond'],
+            'neg_cond': cond_512['neg_cond'],
+        }
+        if cond_1024 is not None:
+            conditioning['cond_1024'] = cond_1024['cond']
+        
+        # Sample sparse structure
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[self.pipeline_type]
+        coords = self.pipeline.sample_sparse_structure(
+            cond_512, ss_res,
+            num_samples=1,
+            sampler_params={
+                'steps': ss_sampling_steps,
+                'guidance_strength': ss_guidance_scale,
             }
-            if cond_1024 is not None:
-                conditioning['cond_1024'] = cond_1024['cond']
-            
-            # Sample sparse structure
-            ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[self.pipeline_type]
-            coords = self.pipeline.sample_sparse_structure(
-                cond_512, ss_res,
-                num_samples=1,
+        )
+        
+        # Sample shape
+        cond_dict_512 = {'cond': conditioning['cond_512'], 'neg_cond': conditioning['neg_cond']}
+        cond_dict_1024 = None
+        if 'cond_1024' in conditioning:
+            cond_dict_1024 = {'cond': conditioning['cond_1024'], 'neg_cond': conditioning['neg_cond']}
+        
+        if self.pipeline_type == '512':
+            shape_slat = self.pipeline.sample_shape_slat(
+                cond_dict_512, self.pipeline.models['shape_slat_flow_model_512'],
+                coords,
                 sampler_params={
-                    'steps': ss_sampling_steps,
-                    'guidance_strength': ss_guidance_scale,
+                    'steps': shape_sampling_steps,
+                    'guidance_strength': shape_guidance_scale,
                 }
             )
-            
-            # Sample shape
-            cond_dict_512 = {'cond': conditioning['cond_512'], 'neg_cond': conditioning['neg_cond']}
-            cond_dict_1024 = None
-            if 'cond_1024' in conditioning:
-                cond_dict_1024 = {'cond': conditioning['cond_1024'], 'neg_cond': conditioning['neg_cond']}
-            
-            if self.pipeline_type == '512':
-                shape_slat = self.pipeline.sample_shape_slat(
-                    cond_dict_512, self.pipeline.models['shape_slat_flow_model_512'],
-                    coords,
-                    sampler_params={
-                        'steps': shape_sampling_steps,
-                        'guidance_strength': shape_guidance_scale,
-                    }
-                )
-                res = 512
-            elif self.pipeline_type == '1024':
-                shape_slat = self.pipeline.sample_shape_slat(
-                    cond_dict_1024, self.pipeline.models['shape_slat_flow_model_1024'],
-                    coords,
-                    sampler_params={
-                        'steps': shape_sampling_steps,
-                        'guidance_strength': shape_guidance_scale,
-                    }
-                )
-                res = 1024
-            elif self.pipeline_type in ('1024_cascade', '1536_cascade'):
-                target_res = 1024 if self.pipeline_type == '1024_cascade' else 1536
-                shape_slat, res = self.pipeline.sample_shape_slat_cascade(
-                    cond_dict_512, cond_dict_1024,
-                    self.pipeline.models['shape_slat_flow_model_512'],
-                    self.pipeline.models['shape_slat_flow_model_1024'],
-                    512, target_res,
-                    coords,
-                    sampler_params={
-                        'steps': shape_sampling_steps,
-                        'guidance_strength': shape_guidance_scale,
-                    },
-                    max_num_tokens=self.max_num_tokens
-                )
-            else:
-                raise ValueError(f"Invalid pipeline type: {self.pipeline_type}")
-            
-            # Decode shape
-            meshes, subs = self.pipeline.decode_shape_slat(shape_slat, res)
-            mesh = meshes[0]
-            mesh.fill_holes()
-            
-            # Export untextured mesh as GLB
-            shape_output_path = os.path.join(SAVE_DIR, f'{uid}_shape.glb')
-            
-            # Simple GLB export for untextured mesh
-            tri_mesh = trimesh.Trimesh(
-                vertices=mesh.vertices.cpu().numpy(),
-                faces=mesh.faces.cpu().numpy(),
-                process=False
+            res = 512
+        elif self.pipeline_type == '1024':
+            shape_slat = self.pipeline.sample_shape_slat(
+                cond_dict_1024, self.pipeline.models['shape_slat_flow_model_1024'],
+                coords,
+                sampler_params={
+                    'steps': shape_sampling_steps,
+                    'guidance_strength': shape_guidance_scale,
+                }
             )
-            tri_mesh.export(shape_output_path)
-            
-            logger.info(f"[{uid}] Shape generated and saved to {shape_output_path}")
-            
-            # Store intermediate data for texture generation
-            self.job_tracker.update_job(
-                image_hash,
-                status='texture_processing',
-                shape_path=shape_output_path,
-                shape_slat=shape_slat,
-                subs=subs,
-                meshes=meshes,
-                resolution=res,
-                conditioning=conditioning,
+            res = 1024
+        elif self.pipeline_type in ('1024_cascade', '1536_cascade'):
+            target_res = 1024 if self.pipeline_type == '1024_cascade' else 1536
+            shape_slat, res = self.pipeline.sample_shape_slat_cascade(
+                cond_dict_512, cond_dict_1024,
+                self.pipeline.models['shape_slat_flow_model_512'],
+                self.pipeline.models['shape_slat_flow_model_1024'],
+                512, target_res,
+                coords,
+                sampler_params={
+                    'steps': shape_sampling_steps,
+                    'guidance_strength': shape_guidance_scale,
+                },
+                max_num_tokens=self.max_num_tokens
             )
-            
-            # Start texture generation in background
-            threading.Thread(
-                target=self._generate_texture_background,
-                args=(uid, image_hash, seed, params),
-                daemon=True
-            ).start()
-            
-            return shape_output_path, image_hash
-            
-        except Exception as e:
-            logger.error(f"[{uid}] Shape generation failed: {e}")
-            traceback.print_exc()
-            self.job_tracker.update_job(image_hash, status='error', error=str(e))
-            raise
+        else:
+            raise ValueError(f"Invalid pipeline type: {self.pipeline_type}")
+        
+        # Decode shape
+        meshes, subs = self.pipeline.decode_shape_slat(shape_slat, res)
+        mesh = meshes[0]
+        mesh.fill_holes()
+        
+        # Export untextured mesh as GLB
+        shape_output_path = os.path.join(SAVE_DIR, f'{uid}_shape.glb')
+        
+        # Simple GLB export for untextured mesh
+        tri_mesh = trimesh.Trimesh(
+            vertices=mesh.vertices.cpu().numpy(),
+            faces=mesh.faces.cpu().numpy(),
+            process=False
+        )
+        tri_mesh.export(shape_output_path)
+        
+        logger.info(f"[{uid}] Shape generated and saved to {shape_output_path}")
+        
+        # Store intermediate data for texture generation
+        self.job_tracker.update_job(
+            image_hash,
+            status='texture_processing',
+            shape_path=shape_output_path,
+            shape_slat=shape_slat,
+            subs=subs,
+            meshes=meshes,
+            resolution=res,
+            conditioning=conditioning,
+        )
+        
+        return shape_output_path
 
-    def _generate_texture_background(self, uid: str, image_hash: str, seed: int, params: dict):
-        """Generate texture in background thread"""
+    def _generate_texture_impl(self, uid: str, image_hash: str, params: dict):
+        """Generate texture internal implementation"""
+        seed = params.get("seed", self.seed)
         try:
             job = self.job_tracker.get_job(image_hash)
             if not job:
@@ -518,7 +601,7 @@ async def generate(request: Request):
     uid = str(uuid.uuid4())
     
     try:
-        shape_path, image_hash = worker.generate_shape(uid, params)
+        shape_path, image_hash = await worker.submit_request(uid, params)
         logger.info(f"Generated shape saved at {shape_path}")
         
         # Return shape GLB immediately

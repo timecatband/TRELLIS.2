@@ -123,6 +123,7 @@ fi
 if [ "$CUMESH" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive
+    sed -i 's/nvcc_flags = \[\]/nvcc_flags = \["--expt-extended-lambda"\]/' /tmp/extensions/CuMesh/setup.py
     pip install /tmp/extensions/CuMesh --no-build-isolation
 fi
 
