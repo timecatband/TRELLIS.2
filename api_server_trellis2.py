@@ -544,7 +544,7 @@ class Trellis2Worker:
                 remesh_project=0,
                 verbose=True
             )
-            glb.export(texture_output_path, extension_webp=True)
+            glb.export(texture_output_path, extension_webp=False)
             
             logger.info(f"[{uid}] Texture generated and saved to {texture_output_path}")
             
