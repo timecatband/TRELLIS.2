@@ -7,5 +7,5 @@ ln -sf /usr/include/eigen3/Eigen /usr/include/Eigen
 pip install ninja
 pip install psutil
 pip install fastapi uvicorn
-MAX_JOBS=12 pip install flash-attn --no-build-isolation --extra-index-url https://pypi.nvidia.com
+python3 get_flash_attn.py
 bash setup.sh --basic --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
