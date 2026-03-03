@@ -384,3 +384,96 @@ def to_glb(
     _log("complete")
     
     return textured_mesh
+def remesh(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    aabb: Union[list, tuple, np.ndarray, torch.Tensor],
+    voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
+    grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
+    decimation_target: int = 1000000,
+    remesh_band: float = 1,
+    remesh_project: float = 0.9,
+    verbose: bool = False,
+):
+    """
+    Standalone remeshing functionality detached from the full PBR rendering pipeline.
+    """
+    if isinstance(aabb, (list, tuple)):
+        aabb = np.array(aabb)
+    if isinstance(aabb, np.ndarray):
+        aabb = torch.tensor(aabb, dtype=torch.float32, device=vertices.device)
+    assert isinstance(aabb, torch.Tensor), f"aabb must be a list, tuple, np.ndarray, or torch.Tensor, but got {type(aabb)}"
+    assert aabb.dim() == 2, f"aabb must be a 2D tensor, but got {aabb.shape}"
+    assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
+    assert aabb.size(1) == 3, f"aabb must have 3 columns, but got {aabb.size(1)}"
+
+    # Calculate grid dimensions based on AABB and voxel size
+    if voxel_size is not None:
+        if isinstance(voxel_size, float):
+            voxel_size = [voxel_size, voxel_size, voxel_size]
+        if isinstance(voxel_size, (list, tuple)):
+            voxel_size = np.array(voxel_size)
+        if isinstance(voxel_size, np.ndarray):
+            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=vertices.device)
+        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+    else:
+        assert grid_size is not None, "Either voxel_size or grid_size must be provided"
+        if isinstance(grid_size, int):
+            grid_size = [grid_size, grid_size, grid_size]
+        if isinstance(grid_size, (list, tuple)):
+            grid_size = np.array(grid_size)
+        if isinstance(grid_size, np.ndarray):
+            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=vertices.device)
+        voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+    vertices = vertices.cuda()
+    faces = faces.cuda()
+    
+    # Initialize CUDA mesh handler
+    mesh = cumesh.CuMesh()
+    mesh.init(vertices, faces)
+    
+    # --- Initial Mesh Cleaning ---
+    mesh.fill_holes(max_hole_perimeter=3e-2)
+    vertices, faces = mesh.read()
+
+    bvh = cumesh.cuBVH(vertices, faces)
+
+    center = aabb.mean(dim=0)
+    scale = (aabb[1] - aabb[0]).max().item()
+    resolution = grid_size.max().item()
+
+    mesh.init(*cumesh.remeshing.remesh_narrow_band_dc(
+        vertices, faces,
+        center = center,
+        scale = (resolution + 3 * remesh_band) / resolution * scale,
+        resolution = resolution,
+        band = remesh_band,
+        project_back = remesh_project, # Snaps vertices back to original surface
+        verbose = verbose,
+        bvh = bvh,
+    ))
+    
+    if verbose:
+        print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+
+    mesh.simplify(decimation_target, verbose=verbose)
+    
+    if verbose:
+        print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+
+    out_vertices, out_faces = mesh.read()
+
+    vertices_np = out_vertices.cpu().numpy()
+    faces_np = out_faces.cpu().numpy()
+
+    # Swap Y and Z axes, invert Y (common conversion for GLB compatibility)
+    vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
+    
+    untextured_mesh = trimesh.Trimesh(
+        vertices=vertices_np,
+        faces=faces_np,
+        process=False,
+    )
+
+    return untextured_mesh

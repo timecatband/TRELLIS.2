@@ -421,11 +421,16 @@ class Trellis2Worker:
         # Export untextured mesh as GLB
         shape_output_path = os.path.join(SAVE_DIR, f'{uid}_shape.glb')
         
-        # Simple GLB export for untextured mesh
-        tri_mesh = trimesh.Trimesh(
-            vertices=mesh.vertices.cpu().numpy(),
-            faces=mesh.faces.cpu().numpy(),
-            process=False
+        # Use new remeshing logic for untextured mesh
+        tri_mesh = o_voxel.postprocess.remesh(
+            vertices=mesh.vertices,
+            faces=mesh.faces,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            voxel_size=1 / res,
+            decimation_target=self.glb_decimation_target,
+            remesh_band=1,
+            remesh_project=0,
+            verbose=True
         )
         tri_mesh.export(shape_output_path)
         
