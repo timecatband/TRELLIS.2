@@ -547,6 +547,7 @@ class Trellis2Worker:
         
         return shape_output_path
 
+    @torch.inference_mode()
     def _generate_texture_impl(self, uid: str, image_hash: str, params: dict):
         """Generate texture internal implementation"""
         seed = params.get("seed", self.seed)
@@ -656,6 +657,11 @@ class Trellis2Worker:
                 texture_path=texture_output_path,
             )
             
+        except Exception as e:
+            logger.error(f"[{uid}] Texture generation failed: {e}")
+            traceback.print_exc()
+            self.job_tracker.update_job(image_hash, status='error', error=str(e))
+        finally:
             # Cleanup intermediate data to free memory
             self.job_tracker.update_job(
                 image_hash,
@@ -667,11 +673,6 @@ class Trellis2Worker:
             
             gc.collect()
             torch.cuda.empty_cache()
-            
-        except Exception as e:
-            logger.error(f"[{uid}] Texture generation failed: {e}")
-            traceback.print_exc()
-            self.job_tracker.update_job(image_hash, status='error', error=str(e))
 
     def wait_for_texture(self, image_hash: str, timeout: float = 300) -> Optional[str]:
         """Wait for texture generation to complete, return path or None"""
