@@ -22,7 +22,7 @@
     "max_num_tokens": 24576
   },
   "export": {
-    "glb_decimation_target": 500000,
+    "glb_decimation_target": 250000,
     "glb_texture_size": 2048
   },
   "worker": {
