@@ -1,6 +1,6 @@
 # Multi-View GPT Image Teacher Texture LoRA
 
-This guide explains how to build a self-generated teacher dataset and train a LoRA adapter for TRELLIS.2 texture generation. The v1 setup uses TRELLIS.2 512-mode assets, renders four views per asset, asks GPT Image 2 to repair each visible albedo view, projects the repaired views back into PBR voxels, encodes teacher texture latents, and trains a LoRA on `tex_slat_flow_model_512`.
+This guide explains how to build a self-generated teacher dataset and train a LoRA adapter for TRELLIS.2 texture generation. The v1 setup uses TRELLIS.2 512-mode assets, renders four views per asset, asks GPT Image 2 to repair each visible albedo view using the original source image as a style/content reference, projects the repaired views back into PBR voxels, encodes teacher texture latents, and trains a LoRA on `tex_slat_flow_model_512`.
 
 ## 1. Prepare Input Images
 
@@ -52,6 +52,16 @@ python tools/build_gpt_image_teacher_dataset.py \
   --teacher_quality high
 ```
 
+By default, each GPT Image teacher request includes the original source image that produced the TRELLIS asset. The teacher prompt tells GPT Image 2 to make the repaired visible albedo look more like that source image while preserving the generated render's silhouette, camera, geometry, and part layout. With `--include_normal_reference`, the request images are ordered as:
+
+```text
+1. rendered albedo/base-color view from the generated 3D asset
+2. camera-space normal map for that same view
+3. original input/source image
+```
+
+Without `--include_normal_reference`, the request includes the rendered albedo first and the source image second. Use `--no_source_reference` only for ablations where GPT Image 2 should repair the generated albedo without seeing the original input image.
+
 What the builder writes:
 
 ```text
@@ -84,7 +94,12 @@ Number of GPT Image teacher views per asset.
 ```sh
 --include_normal_reference
 ```
-Sends both the rendered albedo and camera-space normal map to GPT Image 2, asking for a geometry-aligned new albedo.
+Sends the camera-space normal map along with the rendered albedo and default source reference, asking for a geometry-aligned new albedo.
+
+```sh
+--no_source_reference
+```
+Disables the default original-image reference. This is mainly useful for ablations; normal dataset builds should leave source references enabled so the repaired albedo stays faithful to the input that produced the asset.
 
 ```sh
 --teacher_size auto
@@ -115,6 +130,7 @@ Look for:
 
 - `teacher_accepted_views` should usually be at least `1`; higher is better.
 - Teacher images should preserve silhouette, viewpoint, and part boundaries.
+- Teacher images should move texture detail toward the original source image without changing the generated view geometry.
 - Normal-reference runs should improve alignment on high-curvature or detailed geometry.
 - Fused targets should not show obvious baked shadows or background colors.
 
@@ -272,7 +288,7 @@ python tools/eval_texture_lora.py \
 
 - This is 512 texture-flow LoRA only. The 1024/cascade texture path is intentionally left for a later experiment.
 - V1 distills base color only. Metallic, roughness, and alpha are preserved from TRELLIS.
-- The teacher may hallucinate details. The normal-map reference and alignment filters reduce this risk, but human inspection is still important.
+- The teacher may hallucinate details. The source-image reference, normal-map reference, and alignment filters reduce this risk, but human inspection is still important.
 - GPT Image calls are per view. With the default `--num_views 4`, each asset makes four image edit requests.
 - The local environment must have the full TRELLIS runtime installed, including PyTorch, CUDA dependencies, OpenAI Python SDK, and the TRELLIS model dependencies.
 
@@ -280,6 +296,7 @@ python tools/eval_texture_lora.py \
 
 - Dataset build stops early: rerun with `--keep_going`, then inspect `logs/failures.jsonl`.
 - Teacher edits look misaligned: enable `--include_normal_reference`, inspect `renders/<id>/*_normal.png`, and tighten the prompt.
+- Teacher edits look generic or unlike the input: confirm you did not pass `--no_source_reference`, inspect `source_images/<id>.png`, and make sure the input image is clean enough to serve as a reference.
 - Too many rejected views: compare `renders/<id>/*_base_color.png` to `teacher_views/<id>/*_teacher.png`, then tune `--min_mask_iou` and `--max_teacher_delta`.
 - Low projected coverage: increase `--num_views`, inspect `teacher_projected_voxel_fraction`, and check whether depth/mask renders look correct.
 - Training loss is noisy: reduce `--lr`, reduce `--visible_weight`, or start with a smaller pilot dataset and inspect `mse_teacher_tokens` vs `mse_base_tokens`.

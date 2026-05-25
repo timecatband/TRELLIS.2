@@ -32,16 +32,32 @@ from trellis2.utils.random_utils import sphere_hammersley_sequence
 from trellis2.utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
 
 
-DEFAULT_TEACHER_PROMPT = """Improve only the visible texture/albedo detail of this rendered 3D asset view.
-Preserve the object silhouette, camera viewpoint, geometry, material identity, colors, and all boundaries.
+DEFAULT_TEACHER_PROMPT = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
+Generate a new improved albedo/base-color image only: sharper, more coherent texture detail, but still pixel-aligned to the first image.
+Preserve silhouette, camera viewpoint, object boundaries, geometry, material identity, and colors.
 Do not add text, background, new parts, lighting effects, shadows, or view changes.
-Return a clean texture/base-color style image aligned pixel-for-pixel to the input."""
+Return only the repaired albedo/base-color view."""
 
-DEFAULT_TEACHER_PROMPT_WITH_NORMAL = """Use the first input image as the current albedo/base-color render.
+DEFAULT_TEACHER_PROMPT_WITH_SOURCE = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
+Use the second input image as the original source/reference image that the 3D asset was generated from.
+Generate a new improved albedo/base-color image only: make the visible texture look more like the source/reference image while staying pixel-aligned to the generated render.
+Preserve the generated render's silhouette, camera viewpoint, object boundaries, geometry, and visible part layout.
+Do not add text, background, new parts, lighting effects, shadows, geometry changes, or view changes.
+Return only the repaired albedo/base-color view."""
+
+DEFAULT_TEACHER_PROMPT_WITH_NORMAL = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
 Use the second input image as a camera-space normal map that defines the exact visible geometry.
 Generate a new improved albedo/base-color image only: sharper, more coherent texture detail, but still pixel-aligned to the first image and geometrically consistent with the normal map.
 Preserve silhouette, camera viewpoint, object boundaries, material identity, and colors.
 Do not add text, background, new parts, lighting effects, shadows, geometry changes, or normal-map colors.
+Return only the repaired albedo/base-color view."""
+
+DEFAULT_TEACHER_PROMPT_WITH_NORMAL_AND_SOURCE = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
+Use the second input image as a camera-space normal map that defines the exact visible geometry.
+Use the third input image as the original source/reference image that the 3D asset was generated from.
+Generate a new improved albedo/base-color image only: make the visible texture look more like the source/reference image while staying pixel-aligned to the generated render and geometrically consistent with the normal map.
+Preserve the generated render's silhouette, camera viewpoint, object boundaries, geometry, and visible part layout.
+Do not add text, background, new parts, lighting effects, shadows, geometry changes, normal-map colors, or view changes.
 Return only the repaired albedo/base-color view."""
 
 
@@ -219,15 +235,25 @@ def render_view(renderer, envmap, mesh, view):
     return renderer.render(mesh, view["extrinsics"], view["intrinsics"], envmap=envmap)
 
 
-def teacher_prompt(args, has_normal_reference: bool) -> str:
+def teacher_prompt(args, has_normal_reference: bool, has_source_reference: bool) -> str:
     if args.teacher_prompt is not None:
         return args.teacher_prompt
+    if has_normal_reference and has_source_reference:
+        return DEFAULT_TEACHER_PROMPT_WITH_NORMAL_AND_SOURCE
     if has_normal_reference:
         return DEFAULT_TEACHER_PROMPT_WITH_NORMAL
+    if has_source_reference:
+        return DEFAULT_TEACHER_PROMPT_WITH_SOURCE
     return DEFAULT_TEACHER_PROMPT
 
 
-def call_gpt_image_teacher(input_path: str, output_path: str, args, normal_path: Optional[str] = None):
+def call_gpt_image_teacher(
+    input_path: str,
+    output_path: str,
+    args,
+    normal_path: Optional[str] = None,
+    source_path: Optional[str] = None,
+):
     if args.skip_teacher:
         Image.open(input_path).save(output_path)
         return
@@ -240,14 +266,19 @@ def call_gpt_image_teacher(input_path: str, output_path: str, args, normal_path:
     client = OpenAI(api_key=args.openai_api_key or None)
     with ExitStack() as stack:
         image_file = stack.enter_context(open(input_path, "rb"))
-        image_input = image_file
+        image_input = [image_file]
         if normal_path is not None:
             normal_file = stack.enter_context(open(normal_path, "rb"))
-            image_input = [image_file, normal_file]
+            image_input.append(normal_file)
+        if source_path is not None:
+            source_file = stack.enter_context(open(source_path, "rb"))
+            image_input.append(source_file)
+        if len(image_input) == 1:
+            image_input = image_input[0]
         request = {
             "model": args.teacher_model,
             "image": image_input,
-            "prompt": teacher_prompt(args, normal_path is not None),
+            "prompt": teacher_prompt(args, normal_path is not None, source_path is not None),
             "size": args.teacher_size,
             "quality": args.teacher_quality,
             "output_format": "png",
@@ -459,8 +490,15 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
         else:
             normal_path = None
 
+        source_reference_path = None if args.no_source_reference else source_save_path
         try:
-            call_gpt_image_teacher(render_path, teacher_path, args, normal_path=normal_path)
+            call_gpt_image_teacher(
+                render_path,
+                teacher_path,
+                args,
+                normal_path=normal_path,
+                source_path=source_reference_path,
+            )
         except Exception as exc:
             logger.exception("teacher_failed id=%s view=%s", record.safe_id, view["index"])
             append_jsonl(os.path.join(out_dir, "logs", "failures.jsonl"), {
@@ -477,6 +515,7 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
                     "accepted": False,
                     "alignment_score": 0.0,
                     "normal_reference": bool(args.include_normal_reference),
+                    "source_reference": not bool(args.no_source_reference),
                     "error": repr(exc),
                     "elapsed_sec": time.time() - view_start,
                 })
@@ -498,6 +537,7 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             "accepted": bool(accepted),
             "alignment_score": float(score),
             "normal_reference": bool(args.include_normal_reference),
+            "source_reference": not bool(args.no_source_reference),
             "elapsed_sec": time.time() - view_start,
         })
         logger.info(
@@ -614,6 +654,8 @@ def parse_args():
     parser.add_argument("--teacher_prompt", type=str, default=None)
     parser.add_argument("--include_normal_reference", action="store_true",
                         help="Send the rendered normal map with the albedo render to the GPT Image teacher.")
+    parser.add_argument("--no_source_reference", action="store_true",
+                        help="Do not send the original input/source image to the GPT Image teacher.")
     parser.add_argument("--openai_api_key", type=str, default=None)
     parser.add_argument("--skip_teacher", action="store_true", help="Dry-run by copying the original render as the teacher.")
     parser.add_argument("--skip_existing", action="store_true")
@@ -648,7 +690,14 @@ def main():
     if args.max_items is not None:
         records = records[:args.max_items]
     write_run_config(args.output_dir, args, records)
-    logger.info("run_start inputs=%s output_dir=%s skip_teacher=%s normal_reference=%s", len(records), args.output_dir, args.skip_teacher, args.include_normal_reference)
+    logger.info(
+        "run_start inputs=%s output_dir=%s skip_teacher=%s normal_reference=%s source_reference=%s",
+        len(records),
+        args.output_dir,
+        args.skip_teacher,
+        args.include_normal_reference,
+        not args.no_source_reference,
+    )
 
     torch.set_grad_enabled(False)
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_path)
