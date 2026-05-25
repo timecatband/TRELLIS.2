@@ -85,7 +85,7 @@ fi
 
 if [ "$FLASHATTN" = true ] ; then
     if [ "$PLATFORM" = "cuda" ] ; then
-        pip install flash-attn==2.7.3 --no-build-isolation
+        python3 get_flash_attn.py --version "${FLASH_ATTN_VERSION:-2.7.3}" || { return 1 2>/dev/null || exit 1; }
     elif [ "$PLATFORM" = "hip" ] ; then
         echo "[FLASHATTN] Prebuilt binaries not found. Building from source..."
         mkdir -p /tmp/extensions

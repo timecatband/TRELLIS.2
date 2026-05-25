@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -59,6 +59,11 @@ Generate a new improved albedo/base-color image only: make the visible texture l
 Preserve the generated render's silhouette, camera viewpoint, object boundaries, geometry, and visible part layout.
 Do not add text, background, new parts, lighting effects, shadows, geometry changes, normal-map colors, or view changes.
 Return only the repaired albedo/base-color view."""
+
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    RESAMPLE_LANCZOS = Image.LANCZOS
 
 
 @dataclass
@@ -143,6 +148,7 @@ def read_inputs(args) -> List[InputRecord]:
 def ensure_dirs(output_dir: str, shape_name: str, teacher_name: str):
     for rel in [
         "source_images",
+        "intermediate_images",
         "mesh_npz",
         "pbr_voxels/original",
         "pbr_voxels/fused",
@@ -171,6 +177,64 @@ def chw_to_pil(tensor: torch.Tensor) -> Image.Image:
         return Image.fromarray(arr, mode="L")
     arr = (tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     return Image.fromarray(arr)
+
+
+def image_copy(path: str) -> Image.Image:
+    with Image.open(path) as image:
+        return image.copy()
+
+
+def fit_image_tile(image: Image.Image, size: Tuple[int, int]) -> Image.Image:
+    image = ImageOps.contain(image.convert("RGBA"), size, RESAMPLE_LANCZOS)
+    tile = Image.new("RGB", size, (255, 255, 255))
+    tile.paste(image.convert("RGB"), ((size[0] - image.width) // 2, (size[1] - image.height) // 2), image.getchannel("A"))
+    return tile
+
+
+def save_image_sheet(
+    items: List[Tuple[str, Image.Image]],
+    output_path: str,
+    *,
+    tile_size: Tuple[int, int] = (256, 256),
+    header_height: int = 28,
+):
+    if not items:
+        return
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    font = ImageFont.load_default()
+    tiles = []
+    for label, image in items:
+        tile = Image.new("RGB", (tile_size[0], tile_size[1] + header_height), (242, 242, 242))
+        tile.paste(fit_image_tile(image, tile_size), (0, header_height))
+        draw = ImageDraw.Draw(tile)
+        draw.rectangle((0, 0, tile.width - 1, header_height - 1), fill=(232, 232, 232))
+        draw.text((8, 8), label[:64], fill=(20, 20, 20), font=font)
+        tiles.append(tile)
+
+    sheet = Image.new("RGB", (tile_size[0] * len(tiles), tile_size[1] + header_height), (255, 255, 255))
+    for index, tile in enumerate(tiles):
+        sheet.paste(tile, (index * tile_size[0], 0))
+    sheet.save(output_path)
+
+
+def save_vertical_stack(image_paths: List[str], output_path: str, *, gap: int = 8):
+    images = [image_copy(path).convert("RGB") for path in image_paths if os.path.exists(path)]
+    if not images:
+        return
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    width = max(image.width for image in images)
+    height = sum(image.height for image in images) + gap * (len(images) - 1)
+    stack = Image.new("RGB", (width, height), (255, 255, 255))
+    y = 0
+    for image in images:
+        stack.paste(image, ((width - image.width) // 2, y))
+        y += image.height + gap
+    stack.save(output_path)
+
+
+def intermediate_dir(output_dir: str, safe_id: str) -> str:
+    return os.path.join(output_dir, "intermediate_images", safe_id)
 
 
 def save_sparse(path: str, tensor: SparseTensor):
@@ -321,6 +385,96 @@ def image_alignment_score(original_rgb: torch.Tensor, original_mask: torch.Tenso
     return accepted, score, teacher_rgb, teacher_alpha
 
 
+def save_teacher_view_intermediates(
+    out_dir: str,
+    record: InputRecord,
+    view: dict,
+    source: Image.Image,
+    render_path: str,
+    mask_path: str,
+    normal_path: Optional[str],
+    teacher_path: str,
+    accepted: bool,
+    score: float,
+):
+    inspect_dir = intermediate_dir(out_dir, record.safe_id)
+    os.makedirs(inspect_dir, exist_ok=True)
+    source.save(os.path.join(inspect_dir, "source.png"))
+
+    prefix = f"view_{view['index']:02d}"
+    render_image = image_copy(render_path)
+    mask_image = image_copy(mask_path)
+    teacher_image = image_copy(teacher_path)
+    teacher_image.save(os.path.join(inspect_dir, f"{prefix}_gpt_output.png"))
+    render_image.save(os.path.join(inspect_dir, f"{prefix}_gpt_input_base_color.png"))
+    mask_image.save(os.path.join(inspect_dir, f"{prefix}_mask.png"))
+
+    sheet_items = [
+        ("source", source),
+        ("GPT input albedo", render_image),
+    ]
+    if normal_path is not None and os.path.exists(normal_path):
+        normal_image = image_copy(normal_path)
+        normal_image.save(os.path.join(inspect_dir, f"{prefix}_normal_reference.png"))
+        sheet_items.append(("normal reference", normal_image))
+    sheet_items.extend([
+        ("mask", mask_image),
+        (f"GPT output {'accepted' if accepted else 'rejected'} {score:.3f}", teacher_image),
+    ])
+    save_image_sheet(sheet_items, os.path.join(inspect_dir, f"{prefix}_gpt_compare.png"))
+
+
+def save_fused_intermediates(
+    out_dir: str,
+    record: InputRecord,
+    mesh,
+    fused_attrs: torch.Tensor,
+    views: List[dict],
+    view_records: List[dict],
+    renderer,
+    envmap,
+    source: Image.Image,
+):
+    inspect_dir = intermediate_dir(out_dir, record.safe_id)
+    os.makedirs(inspect_dir, exist_ok=True)
+
+    fused_mesh = mesh.to(mesh.device)
+    fused_mesh.attrs = fused_attrs.detach().to(mesh.attrs.device)
+    view_records_by_index = {int(row["view_index"]): row for row in view_records}
+    comparison_paths = []
+
+    for view in views:
+        prefix = f"view_{view['index']:02d}"
+        buffers = render_view(renderer, envmap, fused_mesh, view)
+        fused_base = chw_to_pil(buffers["base_color"])
+        fused_shaded = chw_to_pil(buffers["shaded"])
+        fused_base_path = os.path.join(inspect_dir, f"{prefix}_fused_base_color.png")
+        fused_shaded_path = os.path.join(inspect_dir, f"{prefix}_fused_shaded.png")
+        fused_base.save(fused_base_path)
+        fused_shaded.save(fused_shaded_path)
+
+        render_path = os.path.join(out_dir, "renders", record.safe_id, f"{prefix}_base_color.png")
+        teacher_path = os.path.join(out_dir, "teacher_views", record.safe_id, f"{prefix}_teacher.png")
+        view_record = view_records_by_index.get(int(view["index"]), {})
+        status = "accepted" if view_record.get("accepted") else "rejected"
+        score = float(view_record.get("alignment_score", 0.0))
+
+        sheet_items = [("source", source)]
+        if os.path.exists(render_path):
+            sheet_items.append(("GPT input albedo", image_copy(render_path)))
+        if os.path.exists(teacher_path):
+            sheet_items.append((f"GPT output {status} {score:.3f}", image_copy(teacher_path)))
+        sheet_items.extend([
+            ("fused albedo", fused_base),
+            ("fused shaded", fused_shaded),
+        ])
+        compare_path = os.path.join(inspect_dir, f"{prefix}_projection_compare.png")
+        save_image_sheet(sheet_items, compare_path)
+        comparison_paths.append(compare_path)
+
+    save_vertical_stack(comparison_paths, os.path.join(inspect_dir, "summary.png"))
+
+
 def sample_chw(chw: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     if chw.ndim == 2:
         chw = chw.unsqueeze(0)
@@ -427,12 +581,23 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
     out_dir = args.output_dir
     final_latent_path = os.path.join(out_dir, "pbr_latents", args.teacher_latent_name, f"{record.safe_id}.npz")
     if args.skip_existing and os.path.exists(final_latent_path):
-        logger.info("skip_existing id=%s latent=%s", record.safe_id, final_latent_path)
-        return None
+        final_intermediate_path = os.path.join(intermediate_dir(out_dir, record.safe_id), "summary.png")
+        if args.no_save_intermediate_images or os.path.exists(final_intermediate_path):
+            logger.info("skip_existing id=%s latent=%s", record.safe_id, final_latent_path)
+            return None
+        logger.info(
+            "skip_existing_latent_without_intermediate_images id=%s latent=%s",
+            record.safe_id,
+            final_latent_path,
+        )
 
     source = Image.open(record.image_path)
     source_save_path = os.path.join(out_dir, "source_images", f"{record.safe_id}.png")
     source.save(source_save_path)
+    if not args.no_save_intermediate_images:
+        inspect_dir = intermediate_dir(out_dir, record.safe_id)
+        os.makedirs(inspect_dir, exist_ok=True)
+        source.save(os.path.join(inspect_dir, "source.png"))
 
     logger.info("generate_start id=%s seed=%s image=%s", record.safe_id, record.seed, record.image_path)
     try:
@@ -528,6 +693,19 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             teacher,
             args,
         )
+        if not args.no_save_intermediate_images:
+            save_teacher_view_intermediates(
+                out_dir,
+                record,
+                view,
+                source,
+                render_path,
+                mask_path,
+                normal_path,
+                teacher_path,
+                accepted,
+                score,
+            )
         if accepted:
             projections.append(project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, args, score))
         view_records.append({
@@ -554,6 +732,19 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
     else:
         fused_attrs = mesh.attrs.detach().clone()
         voxel_conf = torch.zeros(mesh.attrs.shape[0], 1, dtype=mesh.attrs.dtype, device=mesh.attrs.device)
+
+    if not args.no_save_intermediate_images:
+        save_fused_intermediates(
+            out_dir,
+            record,
+            mesh,
+            fused_attrs,
+            views,
+            view_records,
+            renderer,
+            envmap,
+            source,
+        )
 
     fused_voxel = SparseTensor(
         feats=fused_attrs.detach().float() * 2.0 - 1.0,
@@ -592,6 +783,10 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
         "id": record.item_id,
         "image_path": record.image_path,
         "source_image_path": os.path.relpath(source_save_path, out_dir),
+        "intermediate_image_dir": None if args.no_save_intermediate_images else os.path.relpath(
+            intermediate_dir(out_dir, record.safe_id),
+            out_dir,
+        ),
         "seed": record.seed,
         "split": record.split,
         "notes": record.notes,
@@ -659,6 +854,8 @@ def parse_args():
     parser.add_argument("--openai_api_key", type=str, default=None)
     parser.add_argument("--skip_teacher", action="store_true", help="Dry-run by copying the original render as the teacher.")
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--no_save_intermediate_images", action="store_true",
+                        help="Disable per-view GPT input/output images, projection previews, and comparison sheets.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_views", type=int, default=4)
     parser.add_argument("--view_offset", type=float, nargs=2, default=[0.0, 0.0])

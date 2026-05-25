@@ -72,6 +72,13 @@ datasets/trellis_teacher_512/
   logs/records.jsonl
   logs/failures.jsonl
   source_images/
+  intermediate_images/<id>/source.png
+  intermediate_images/<id>/view_00_gpt_input_base_color.png
+  intermediate_images/<id>/view_00_gpt_output.png
+  intermediate_images/<id>/view_00_gpt_compare.png
+  intermediate_images/<id>/view_00_fused_base_color.png
+  intermediate_images/<id>/view_00_projection_compare.png
+  intermediate_images/<id>/summary.png
   renders/<id>/view_00_base_color.png
   renders/<id>/view_00_normal.png
   renders/<id>/view_00_mask.png
@@ -122,6 +129,8 @@ Before training, spot-check:
 
 ```sh
 open datasets/trellis_teacher_512/metadata.csv
+open datasets/trellis_teacher_512/intermediate_images/<id>/summary.png
+open datasets/trellis_teacher_512/intermediate_images/<id>/
 open datasets/trellis_teacher_512/renders/<id>/
 open datasets/trellis_teacher_512/teacher_views/<id>/
 ```
@@ -129,10 +138,14 @@ open datasets/trellis_teacher_512/teacher_views/<id>/
 Look for:
 
 - `teacher_accepted_views` should usually be at least `1`; higher is better.
+- `intermediate_images/<id>/view_*_gpt_compare.png` compares the source image, GPT input albedo, optional normal reference, mask, and GPT output.
+- `intermediate_images/<id>/view_*_projection_compare.png` compares GPT output against the fused albedo after projection back onto the asset.
 - Teacher images should preserve silhouette, viewpoint, and part boundaries.
 - Teacher images should move texture detail toward the original source image without changing the generated view geometry.
 - Normal-reference runs should improve alignment on high-curvature or detailed geometry.
 - Fused targets should not show obvious baked shadows or background colors.
+
+Use `--no_save_intermediate_images` only when you want a lean latent-only run and do not need visual inspection files. With `--skip_existing`, a record is treated as complete only after both the teacher latent and `intermediate_images/<id>/summary.png` exist, unless intermediate image saving is disabled.
 
 If too many views are rejected, loosen `--min_mask_iou` slightly or improve the teacher prompt. If teacher images change geometry, tighten the prompt or use `--include_normal_reference`.
 
