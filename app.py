@@ -473,6 +473,9 @@ def extract_glb(
     state: dict,
     decimation_target: int,
     texture_size: int,
+    make_printable: bool,
+    printable_resolution: int,
+    printable_shell_dilation: int,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[str, str]:
@@ -503,6 +506,9 @@ def extract_glb(
         remesh=True,
         remesh_band=1,
         remesh_project=0,
+        solidify=make_printable,
+        solidify_resolution=int(printable_resolution),
+        solidify_shell_dilation=int(printable_shell_dilation),
         use_tqdm=True,
     )
     now = datetime.now()
@@ -530,6 +536,9 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
+            make_printable = gr.Checkbox(label="Make Printable Solid", value=False)
+            printable_resolution = gr.Slider(128, 384, label="Printable Resolution", value=256, step=64)
+            printable_shell_dilation = gr.Slider(0, 3, label="Printable Shell Seal", value=1, step=1)
             
             generate_btn = gr.Button("Generate")
                 
@@ -609,7 +618,14 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         lambda: gr.Walkthrough(selected=1), outputs=walkthrough
     ).then(
         extract_glb,
-        inputs=[output_buf, decimation_target, texture_size],
+        inputs=[
+            output_buf,
+            decimation_target,
+            texture_size,
+            make_printable,
+            printable_resolution,
+            printable_shell_dilation,
+        ],
         outputs=[glb_output, download_btn],
     )
         

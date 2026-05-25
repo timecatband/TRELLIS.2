@@ -66,7 +66,13 @@ See `api_server_config_default.json` for the default configuration:
   },
   "export": {
     "glb_decimation_target": 1000000,
-    "glb_texture_size": 4096
+    "glb_texture_size": 4096,
+    "make_printable": false,
+    "printable_resolution": 256,
+    "printable_shell_dilation": 1,
+    "printable_max_voxels": 16777216,
+    "printable_project_back": true,
+    "printable_project_distance_voxels": 2.5
   },
   "worker": {
     "limit_model_concurrency": 5,
@@ -101,6 +107,12 @@ See `api_server_config_default.json` for the default configuration:
 #### Export Section
 - `glb_decimation_target`: Target face count for GLB export (default: 1,000,000)
 - `glb_texture_size`: Texture resolution for GLB export (default: 4096)
+- `make_printable`: Rebuild exported meshes as filled watertight solids for 3D printing (default: false)
+- `printable_resolution`: CPU voxel resolution along the longest axis for printable solidification (default: 256)
+- `printable_shell_dilation`: Voxel dilation used to seal small cracks before flood-filling interiors (default: 1)
+- `printable_max_voxels`: Safety cap for printable solidification memory use (default: 16,777,216)
+- `printable_project_back`: Projects the filled outer surface back to the generated source mesh to recover detail (default: true)
+- `printable_project_distance_voxels`: Maximum projection distance measured in solidification voxels (default: 2.5)
 
 #### Worker Section
 - `limit_model_concurrency`: Max concurrent requests (default: 5)
@@ -121,11 +133,14 @@ python api_server_trellis2.py --config api_server_config_low_vram.json
 
 # With high quality config
 python api_server_trellis2.py --config api_server_config_high_quality.json
+
+# With 3D-printable solid export
+python api_server_trellis2.py --config api_server_config_printable.json
 ```
 
 ### Example Configurations
 
-Three example configurations are provided:
+Four example configurations are provided:
 
 1. **`api_server_config_default.json`** - Balanced quality and performance
    - Pipeline: 1024_cascade
@@ -142,6 +157,11 @@ Three example configurations are provided:
    - Higher resolution textures
    - ~12-16GB VRAM
    - Reduced concurrency for stability
+
+4. **`api_server_config_printable.json`** - 3D-printable solids
+   - Pipeline: 1024_cascade
+   - Enables watertight solid export
+   - Fills enclosed internal shells/cavities during GLB export
 
 ## API Endpoints
 

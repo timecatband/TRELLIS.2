@@ -3,7 +3,8 @@
   "_description": "Balanced quality and performance. Good for most use cases. ~9GB VRAM.",
   "_see_also": [
     "api_server_config_low_vram.json - For systems with limited VRAM",
-    "api_server_config_high_quality.json - For maximum quality output"
+    "api_server_config_high_quality.json - For maximum quality output",
+    "api_server_config_printable.json - For 3D-printable solid export"
   ],
   "server": {
     "host": "0.0.0.0",
@@ -21,7 +22,13 @@
   },
   "export": {
     "glb_decimation_target": 1000000,
-    "glb_texture_size": 4096
+    "glb_texture_size": 4096,
+    "make_printable": false,
+    "printable_resolution": 256,
+    "printable_shell_dilation": 1,
+    "printable_max_voxels": 16777216,
+    "printable_project_back": true,
+    "printable_project_distance_voxels": 2.5
   },
   "worker": {
     "limit_model_concurrency": 5,

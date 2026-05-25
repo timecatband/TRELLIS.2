@@ -162,6 +162,10 @@ glb = o_voxel.postprocess.to_glb(
     remesh              =   True,
     remesh_band         =   1,
     remesh_project      =   0,
+    # Optional: set solidify=True for watertight 3D-printable export.
+    solidify            =   False,
+    solidify_resolution =   256,
+    solidify_project_back = True,
     verbose             =   True
 )
 glb.export("sample.glb", extension_webp=True)

@@ -124,6 +124,12 @@ def remesh(
     decimation_target: int = 1000000,
     remesh_band: float = 1,
     remesh_project: float = 0.9,
+    solidify: bool = False,
+    solidify_resolution: int = 256,
+    solidify_shell_dilation: int = 1,
+    solidify_max_voxels: int = 256 ** 3,
+    solidify_project_back: bool = True,
+    solidify_project_distance_voxels: float = 2.5,
     verbose: bool = False,
 ):
     """
@@ -156,6 +162,18 @@ def remesh(
         if isinstance(grid_size, np.ndarray):
             grid_size = torch.tensor(grid_size, dtype=torch.int32, device=vertices.device)
         voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+    if solidify:
+        vertices, faces = o_voxel.postprocess.solidify_mesh_for_printing(
+            vertices,
+            faces,
+            resolution=solidify_resolution,
+            shell_dilation=solidify_shell_dilation,
+            max_voxels=solidify_max_voxels,
+            project_back=solidify_project_back,
+            project_distance_voxels=solidify_project_distance_voxels,
+            verbose=verbose,
+        )
 
     vertices = vertices.cuda()
     faces = faces.cuda()
@@ -270,7 +288,13 @@ class Trellis2Worker:
                  pipeline_type: str = '1024_cascade',
                  max_num_tokens: int = 49152,
                  glb_decimation_target: int = 1000000,
-                 glb_texture_size: int = 4096):
+                 glb_texture_size: int = 4096,
+                 make_printable: bool = False,
+                 printable_resolution: int = 256,
+                 printable_shell_dilation: int = 1,
+                 printable_max_voxels: int = 256 ** 3,
+                 printable_project_back: bool = True,
+                 printable_project_distance_voxels: float = 2.5):
         self.worker_id = worker_id
         self.device = device
         self.seed = seed
@@ -279,6 +303,12 @@ class Trellis2Worker:
         self.max_num_tokens = max_num_tokens
         self.glb_decimation_target = glb_decimation_target
         self.glb_texture_size = glb_texture_size
+        self.make_printable = make_printable
+        self.printable_resolution = printable_resolution
+        self.printable_shell_dilation = printable_shell_dilation
+        self.printable_max_voxels = printable_max_voxels
+        self.printable_project_back = printable_project_back
+        self.printable_project_distance_voxels = printable_project_distance_voxels
         
         # Job tracking
         self.job_tracker = JobTracker()
@@ -526,8 +556,20 @@ class Trellis2Worker:
             decimation_target=self.glb_decimation_target,
             remesh_band=1,
             remesh_project=0,
+            solidify=self.make_printable,
+            solidify_resolution=self.printable_resolution,
+            solidify_shell_dilation=self.printable_shell_dilation,
+            solidify_max_voxels=self.printable_max_voxels,
+            solidify_project_back=self.printable_project_back,
+            solidify_project_distance_voxels=self.printable_project_distance_voxels,
             verbose=True
         )
+
+        tri_mesh.remove_duplicate_faces()
+        
+        tri_mesh.unify_face_orientations()
+        tri_mesh.compute_vertex_normals()
+        
         tri_mesh.export(shape_output_path)
         
         logger.info(f"[{uid}] Shape generated and saved to {shape_output_path}")
@@ -644,6 +686,12 @@ class Trellis2Worker:
                 remesh=True,
                 remesh_band=1,
                 remesh_project=0,
+                solidify=self.make_printable,
+                solidify_resolution=self.printable_resolution,
+                solidify_shell_dilation=self.printable_shell_dilation,
+                solidify_max_voxels=self.printable_max_voxels,
+                solidify_project_back=self.printable_project_back,
+                solidify_project_distance_voxels=self.printable_project_distance_voxels,
                 verbose=True
             )
             glb.export(texture_output_path, extension_webp=False)
@@ -888,6 +936,12 @@ Example usage:
         max_num_tokens=generation_config['max_num_tokens'],
         glb_decimation_target=export_config['glb_decimation_target'],
         glb_texture_size=export_config['glb_texture_size'],
+        make_printable=export_config.get('make_printable', False),
+        printable_resolution=export_config.get('printable_resolution', 256),
+        printable_shell_dilation=export_config.get('printable_shell_dilation', 1),
+        printable_max_voxels=export_config.get('printable_max_voxels', 256 ** 3),
+        printable_project_back=export_config.get('printable_project_back', True),
+        printable_project_distance_voxels=export_config.get('printable_project_distance_voxels', 2.5),
     )
     
     # Start periodic cleanup of old jobs

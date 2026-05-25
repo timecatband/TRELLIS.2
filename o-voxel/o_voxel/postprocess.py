@@ -12,6 +12,287 @@ import nvdiffrast.torch as dr
 import cumesh
 
 
+_SCIPY_NDIMAGE = None
+_SCIPY_NDIMAGE_CHECKED = False
+
+
+def _get_scipy_ndimage():
+    global _SCIPY_NDIMAGE, _SCIPY_NDIMAGE_CHECKED
+    if not _SCIPY_NDIMAGE_CHECKED:
+        try:
+            from scipy import ndimage
+            _SCIPY_NDIMAGE = ndimage
+        except Exception:
+            _SCIPY_NDIMAGE = None
+        _SCIPY_NDIMAGE_CHECKED = True
+    return _SCIPY_NDIMAGE
+
+
+def _six_connected_structure() -> np.ndarray:
+    structure = np.zeros((3, 3, 3), dtype=bool)
+    structure[1, 1, 1] = True
+    structure[0, 1, 1] = True
+    structure[2, 1, 1] = True
+    structure[1, 0, 1] = True
+    structure[1, 2, 1] = True
+    structure[1, 1, 0] = True
+    structure[1, 1, 2] = True
+    return structure
+
+
+def _binary_dilate_6(matrix: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """Dilate a 3D boolean volume using 6-connected neighbors."""
+    matrix = matrix.astype(bool, copy=False)
+    iterations = max(0, int(iterations))
+    if iterations == 0:
+        return matrix
+    ndimage = _get_scipy_ndimage()
+    if ndimage is not None:
+        return ndimage.binary_dilation(
+            matrix,
+            structure=_six_connected_structure(),
+            iterations=iterations,
+        )
+    for _ in range(iterations):
+        padded = np.pad(matrix, 1, mode="constant", constant_values=False)
+        matrix = (
+            padded[1:-1, 1:-1, 1:-1] |
+            padded[:-2, 1:-1, 1:-1] |
+            padded[2:, 1:-1, 1:-1] |
+            padded[1:-1, :-2, 1:-1] |
+            padded[1:-1, 2:, 1:-1] |
+            padded[1:-1, 1:-1, :-2] |
+            padded[1:-1, 1:-1, 2:]
+        )
+    return matrix
+
+
+def _fill_enclosed_voxels(occupied: np.ndarray) -> np.ndarray:
+    """Fill every voxel that cannot be reached from the padded volume exterior."""
+    occupied = occupied.astype(bool, copy=False)
+    free = ~occupied
+    seed = np.zeros_like(free, dtype=bool)
+    seed[0, :, :] = free[0, :, :]
+    seed[-1, :, :] = free[-1, :, :]
+    seed[:, 0, :] = free[:, 0, :]
+    seed[:, -1, :] = free[:, -1, :]
+    seed[:, :, 0] = free[:, :, 0]
+    seed[:, :, -1] = free[:, :, -1]
+
+    ndimage = _get_scipy_ndimage()
+    if ndimage is not None:
+        exterior = ndimage.binary_propagation(
+            seed,
+            structure=_six_connected_structure(),
+            mask=free,
+        )
+        return ~exterior
+
+    exterior = seed.copy()
+    frontier = seed
+    while bool(frontier.any()):
+        frontier = _binary_dilate_6(frontier, 1) & free & ~exterior
+        exterior |= frontier
+
+    return ~exterior
+
+
+def _boundary_mesh_from_voxels(
+    voxels: np.ndarray,
+    transform: np.ndarray,
+    index_offset: int = 0,
+) -> trimesh.Trimesh:
+    """Convert filled voxels to a watertight boundary mesh without optional deps."""
+    voxels = voxels.astype(bool, copy=False)
+    padded = np.pad(voxels, 1, mode="constant", constant_values=False)
+    core = padded[1:-1, 1:-1, 1:-1]
+    quads = []
+
+    def add_quads(coords: np.ndarray, axis: int, positive: bool) -> None:
+        if coords.size == 0:
+            return
+        i, j, k = coords[:, 0], coords[:, 1], coords[:, 2]
+        q = np.empty((coords.shape[0], 4, 3), dtype=np.int32)
+
+        if axis == 0 and not positive:
+            x = i
+            q[:, 0] = np.stack([x, j, k], axis=1)
+            q[:, 1] = np.stack([x, j, k + 1], axis=1)
+            q[:, 2] = np.stack([x, j + 1, k + 1], axis=1)
+            q[:, 3] = np.stack([x, j + 1, k], axis=1)
+        elif axis == 0 and positive:
+            x = i + 1
+            q[:, 0] = np.stack([x, j, k], axis=1)
+            q[:, 1] = np.stack([x, j + 1, k], axis=1)
+            q[:, 2] = np.stack([x, j + 1, k + 1], axis=1)
+            q[:, 3] = np.stack([x, j, k + 1], axis=1)
+        elif axis == 1 and not positive:
+            y = j
+            q[:, 0] = np.stack([i, y, k], axis=1)
+            q[:, 1] = np.stack([i + 1, y, k], axis=1)
+            q[:, 2] = np.stack([i + 1, y, k + 1], axis=1)
+            q[:, 3] = np.stack([i, y, k + 1], axis=1)
+        elif axis == 1 and positive:
+            y = j + 1
+            q[:, 0] = np.stack([i, y, k], axis=1)
+            q[:, 1] = np.stack([i, y, k + 1], axis=1)
+            q[:, 2] = np.stack([i + 1, y, k + 1], axis=1)
+            q[:, 3] = np.stack([i + 1, y, k], axis=1)
+        elif axis == 2 and not positive:
+            z = k
+            q[:, 0] = np.stack([i, j, z], axis=1)
+            q[:, 1] = np.stack([i, j + 1, z], axis=1)
+            q[:, 2] = np.stack([i + 1, j + 1, z], axis=1)
+            q[:, 3] = np.stack([i + 1, j, z], axis=1)
+        else:
+            z = k + 1
+            q[:, 0] = np.stack([i, j, z], axis=1)
+            q[:, 1] = np.stack([i + 1, j, z], axis=1)
+            q[:, 2] = np.stack([i + 1, j + 1, z], axis=1)
+            q[:, 3] = np.stack([i, j + 1, z], axis=1)
+
+        quads.append(q)
+
+    add_quads(np.argwhere(core & ~padded[:-2, 1:-1, 1:-1]), axis=0, positive=False)
+    add_quads(np.argwhere(core & ~padded[2:, 1:-1, 1:-1]), axis=0, positive=True)
+    add_quads(np.argwhere(core & ~padded[1:-1, :-2, 1:-1]), axis=1, positive=False)
+    add_quads(np.argwhere(core & ~padded[1:-1, 2:, 1:-1]), axis=1, positive=True)
+    add_quads(np.argwhere(core & ~padded[1:-1, 1:-1, :-2]), axis=2, positive=False)
+    add_quads(np.argwhere(core & ~padded[1:-1, 1:-1, 2:]), axis=2, positive=True)
+
+    if not quads:
+        return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False)
+
+    quads = np.concatenate(quads, axis=0)
+    unique_corners, inverse = np.unique(quads.reshape(-1, 3), axis=0, return_inverse=True)
+    quads = inverse.reshape(-1, 4)
+    faces = np.concatenate([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]], axis=0)
+
+    corner_coords = unique_corners.astype(np.float64) + float(index_offset) - 0.5
+    corners_h = np.concatenate([corner_coords, np.ones((corner_coords.shape[0], 1))], axis=1)
+    vertices = (corners_h @ np.asarray(transform, dtype=np.float64).T)[:, :3]
+
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def _project_vertices_to_source_mesh(
+    vertices: np.ndarray,
+    source_vertices: np.ndarray,
+    source_faces: np.ndarray,
+    max_distance: Optional[float],
+    verbose: bool = False,
+) -> np.ndarray:
+    if not torch.cuda.is_available():
+        if verbose:
+            print("Skipping printable projection: CUDA is not available")
+        return vertices
+
+    try:
+        src_vertices = torch.as_tensor(source_vertices, dtype=torch.float32, device="cuda")
+        src_faces = torch.as_tensor(source_faces, dtype=torch.int32, device="cuda")
+        query = torch.as_tensor(vertices, dtype=torch.float32, device="cuda")
+        bvh = cumesh.cuBVH(src_vertices, src_faces)
+        projected_chunks = []
+
+        for i in range(0, query.shape[0], 1000000):
+            query_chunk = query[i:i + 1000000]
+            distance, face_id, uvw = bvh.unsigned_distance(query_chunk, return_uvw=True)
+            tri_vertices = src_vertices[src_faces[face_id.long()]]
+            projected = (tri_vertices * uvw.unsqueeze(-1)).sum(dim=1)
+            if max_distance is not None:
+                keep_projection = distance <= max_distance
+                projected = torch.where(keep_projection.unsqueeze(-1), projected, query_chunk)
+            projected_chunks.append(projected.cpu())
+
+        return torch.cat(projected_chunks, dim=0).numpy()
+    except Exception as exc:
+        if verbose:
+            print(f"Skipping printable projection: {exc}")
+        return vertices
+
+
+def solidify_mesh_for_printing(
+    vertices: Union[torch.Tensor, np.ndarray],
+    faces: Union[torch.Tensor, np.ndarray],
+    resolution: int = 256,
+    shell_dilation: int = 1,
+    max_voxels: int = 256 ** 3,
+    project_back: bool = True,
+    project_distance_voxels: float = 2.5,
+    verbose: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Rebuild a mesh as a filled, watertight voxel solid for 3D-printable export.
+
+    This is intentionally a post-process: it preserves the generated exterior
+    where possible, but enclosed internal shells/cavities are treated as solid.
+    """
+    resolution = int(resolution)
+    shell_dilation = int(shell_dilation)
+    max_voxels = max(1, int(max_voxels))
+    device = vertices.device if isinstance(vertices, torch.Tensor) else None
+    vertices_np = vertices.detach().cpu().numpy() if isinstance(vertices, torch.Tensor) else np.asarray(vertices)
+    faces_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+
+    source_mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
+    max_extent = float(source_mesh.extents.max())
+    if not np.isfinite(max_extent) or max_extent <= 0:
+        raise ValueError("Cannot solidify a mesh with empty or degenerate bounds")
+
+    pitch = max_extent / max(1, int(resolution))
+    estimated_shape = np.ceil(np.maximum(source_mesh.extents, pitch) / pitch).astype(np.int64) + 2 * (shell_dilation + 2)
+    estimated_voxels = int(np.prod(estimated_shape))
+    if estimated_voxels > max_voxels:
+        pitch *= (estimated_voxels / max_voxels) ** (1.0 / 3.0)
+        if verbose:
+            print(f"Printable solid voxel grid capped at {max_voxels} cells; using pitch {pitch:.6f}")
+
+    voxel_grid = source_mesh.voxelized(pitch, method="subdivide")
+    surface = voxel_grid.matrix.astype(bool, copy=False)
+    pad_width = max(1, int(shell_dilation) + 2)
+    surface = np.pad(surface, pad_width, mode="constant", constant_values=False)
+    if shell_dilation > 0:
+        surface = _binary_dilate_6(surface, shell_dilation)
+
+    filled = _fill_enclosed_voxels(surface)
+    solid_mesh = _boundary_mesh_from_voxels(
+        filled,
+        voxel_grid.transform,
+        index_offset=-pad_width,
+    )
+
+    if solid_mesh.faces.shape[0] == 0:
+        raise ValueError("Solidification produced an empty mesh")
+
+    solid_mesh.remove_duplicate_faces()
+    solid_mesh.remove_unreferenced_vertices()
+    if project_back:
+        max_project_distance = None
+        if project_distance_voxels is not None and project_distance_voxels > 0:
+            max_project_distance = pitch * float(project_distance_voxels)
+        solid_mesh.vertices = _project_vertices_to_source_mesh(
+            solid_mesh.vertices,
+            vertices_np,
+            faces_np,
+            max_distance=max_project_distance,
+            verbose=verbose,
+        )
+    trimesh.repair.fix_normals(solid_mesh)
+
+    if verbose:
+        print(
+            "Printable solid mesh: "
+            f"{solid_mesh.vertices.shape[0]} vertices, {solid_mesh.faces.shape[0]} faces"
+        )
+
+    out_vertices = torch.as_tensor(solid_mesh.vertices, dtype=torch.float32)
+    out_faces = torch.as_tensor(solid_mesh.faces, dtype=torch.int32)
+    if device is not None:
+        out_vertices = out_vertices.to(device)
+        out_faces = out_faces.to(device)
+    return out_vertices, out_faces
+
+
 def to_glb(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -26,6 +307,12 @@ def to_glb(
     remesh: bool = False,
     remesh_band: float = 1,
     remesh_project: float = 0.9,
+    solidify: bool = False,
+    solidify_resolution: int = 256,
+    solidify_shell_dilation: int = 1,
+    solidify_max_voxels: int = 256 ** 3,
+    solidify_project_back: bool = True,
+    solidify_project_distance_voxels: float = 2.5,
     mesh_cluster_threshold_cone_half_angle_rad=np.radians(90.0),
     mesh_cluster_refine_iterations=0,
     mesh_cluster_global_iterations=1,
@@ -51,6 +338,12 @@ def to_glb(
         remesh: whether to perform remeshing
         remesh_band: size of the remeshing band
         remesh_project: projection factor for remeshing
+        solidify: whether to rebuild the mesh as a filled watertight solid for printing
+        solidify_resolution: target voxel resolution along the longest mesh axis
+        solidify_shell_dilation: shell dilation iterations used to seal small cracks before filling
+        solidify_max_voxels: safety cap for CPU solidification grid size
+        solidify_project_back: project the solid outer surface back to the source mesh for detail recovery
+        solidify_project_distance_voxels: maximum projection distance measured in solidification voxels
         mesh_cluster_threshold_cone_half_angle_rad: threshold for cone-based clustering in uv unwrapping
         mesh_cluster_refine_iterations: number of iterations for refining clusters in uv unwrapping
         mesh_cluster_global_iterations: number of global iterations for clustering in uv unwrapping
@@ -111,6 +404,21 @@ def to_glb(
     # Start timing the heavy operations
     _log("starting")
 
+    texture_source_vertices = vertices
+    texture_source_faces = faces
+    if solidify:
+        vertices, faces = solidify_mesh_for_printing(
+            vertices,
+            faces,
+            resolution=solidify_resolution,
+            shell_dilation=solidify_shell_dilation,
+            max_voxels=solidify_max_voxels,
+            project_back=solidify_project_back,
+            project_distance_voxels=solidify_project_distance_voxels,
+            verbose=verbose,
+        )
+        _log("solidify_for_printing")
+
     # Move data to GPU
     vertices = vertices.cuda()
     faces = faces.cuda()
@@ -141,6 +449,20 @@ def to_glb(
     if verbose:
         print("Done")
     _log("bvh_build")
+
+    if solidify:
+        texture_vertices = texture_source_vertices.cuda()
+        texture_faces = texture_source_faces.cuda()
+        texture_mesh = cumesh.CuMesh()
+        texture_mesh.init(texture_vertices, texture_faces)
+        texture_mesh.fill_holes(max_hole_perimeter=3e-2)
+        texture_vertices, texture_faces = texture_mesh.read()
+        texture_bvh = cumesh.cuBVH(texture_vertices, texture_faces)
+        _log("texture_bvh_build")
+    else:
+        texture_vertices = vertices
+        texture_faces = faces
+        texture_bvh = bvh
         
     if use_tqdm:
         pbar.set_description("Cleaning mesh")
@@ -273,8 +595,8 @@ def to_glb(
     
     # Map these positions back to the *original* high-res mesh to get accurate attributes
     # This corrects geometric errors introduced by simplification/remeshing
-    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
-    orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
+    _, face_id, uvw = texture_bvh.unsigned_distance(valid_pos, return_uvw=True)
+    orig_tri_verts = texture_vertices[texture_faces[face_id.long()]] # (N_new, 3, 3)
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
     
     # Trilinear sampling from the attribute volume (Color, Material props)
@@ -393,6 +715,12 @@ def remesh(
     decimation_target: int = 1000000,
     remesh_band: float = 1,
     remesh_project: float = 0.9,
+    solidify: bool = False,
+    solidify_resolution: int = 256,
+    solidify_shell_dilation: int = 1,
+    solidify_max_voxels: int = 256 ** 3,
+    solidify_project_back: bool = True,
+    solidify_project_distance_voxels: float = 2.5,
     verbose: bool = False,
 ):
     """
@@ -425,6 +753,18 @@ def remesh(
         if isinstance(grid_size, np.ndarray):
             grid_size = torch.tensor(grid_size, dtype=torch.int32, device=vertices.device)
         voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+    if solidify:
+        vertices, faces = solidify_mesh_for_printing(
+            vertices,
+            faces,
+            resolution=solidify_resolution,
+            shell_dilation=solidify_shell_dilation,
+            max_voxels=solidify_max_voxels,
+            project_back=solidify_project_back,
+            project_distance_voxels=solidify_project_distance_voxels,
+            verbose=verbose,
+        )
 
     vertices = vertices.cuda()
     faces = faces.cuda()

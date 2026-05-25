@@ -24,7 +24,13 @@
   },
   "export": {
     "glb_decimation_target": 2000000,
-    "glb_texture_size": 8192
+    "glb_texture_size": 8192,
+    "make_printable": false,
+    "printable_resolution": 384,
+    "printable_shell_dilation": 1,
+    "printable_max_voxels": 56623104,
+    "printable_project_back": true,
+    "printable_project_distance_voxels": 2.5
   },
   "worker": {
     "limit_model_concurrency": 2,
