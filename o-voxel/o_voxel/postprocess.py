@@ -175,6 +175,29 @@ def _boundary_mesh_from_voxels(
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
+def clean_trimesh_for_export(mesh: trimesh.Trimesh, fix_normals: bool = False) -> trimesh.Trimesh:
+    if hasattr(mesh, "remove_duplicate_faces"):
+        mesh.remove_duplicate_faces()
+    elif hasattr(mesh, "unique_faces") and hasattr(mesh, "update_faces"):
+        mesh.update_faces(mesh.unique_faces())
+
+    if hasattr(mesh, "remove_unreferenced_vertices"):
+        mesh.remove_unreferenced_vertices()
+
+    if fix_normals:
+        try:
+            trimesh.repair.fix_normals(mesh)
+        except Exception:
+            if hasattr(mesh, "unify_face_orientations"):
+                mesh.unify_face_orientations()
+            if hasattr(mesh, "compute_vertex_normals"):
+                mesh.compute_vertex_normals()
+            else:
+                _ = mesh.vertex_normals
+
+    return mesh
+
+
 def _project_vertices_to_source_mesh(
     vertices: np.ndarray,
     source_vertices: np.ndarray,
@@ -264,8 +287,7 @@ def solidify_mesh_for_printing(
     if solid_mesh.faces.shape[0] == 0:
         raise ValueError("Solidification produced an empty mesh")
 
-    solid_mesh.remove_duplicate_faces()
-    solid_mesh.remove_unreferenced_vertices()
+    clean_trimesh_for_export(solid_mesh)
     if project_back:
         max_project_distance = None
         if project_distance_voxels is not None and project_distance_voxels > 0:
@@ -277,7 +299,7 @@ def solidify_mesh_for_printing(
             max_distance=max_project_distance,
             verbose=verbose,
         )
-    trimesh.repair.fix_normals(solid_mesh)
+    clean_trimesh_for_export(solid_mesh, fix_normals=True)
 
     if verbose:
         print(

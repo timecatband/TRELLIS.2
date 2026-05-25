@@ -565,10 +565,7 @@ class Trellis2Worker:
             verbose=True
         )
 
-        tri_mesh.remove_duplicate_faces()
-        
-        tri_mesh.unify_face_orientations()
-        tri_mesh.compute_vertex_normals()
+        o_voxel.postprocess.clean_trimesh_for_export(tri_mesh, fix_normals=True)
         
         tri_mesh.export(shape_output_path)
         
