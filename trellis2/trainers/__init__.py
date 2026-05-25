@@ -17,6 +17,9 @@ __attributes = {
     'TextConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'ImageConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'MultiImageConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
+    'TeacherSparseFlowMatchingTrainer': 'flow_matching.sparse_flow_matching',
+    'TeacherSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
+    'ImageConditionedTeacherSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     
     'DinoV2FeatureExtractor': 'flow_matching.mixins.image_conditioned',
     'DinoV3FeatureExtractor': 'flow_matching.mixins.image_conditioned',
@@ -60,6 +63,9 @@ if __name__ == '__main__':
         SparseFlowMatchingCFGTrainer,
         TextConditionedSparseFlowMatchingCFGTrainer,
         ImageConditionedSparseFlowMatchingCFGTrainer,
+        TeacherSparseFlowMatchingTrainer,
+        TeacherSparseFlowMatchingCFGTrainer,
+        ImageConditionedTeacherSparseFlowMatchingCFGTrainer,
     )
     
     from .flow_matching.mixins.image_conditioned import (

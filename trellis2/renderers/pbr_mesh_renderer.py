@@ -204,6 +204,7 @@ class PbrMeshRenderer:
             "far": None,
             "ssaa": 1,
             "peel_layers": 8,
+            "return_geometry_buffers": False,
         })
         self.rendering_options.update(rendering_options)
         self.glctx = dr.RasterizeCudaContext(device=device)
@@ -319,6 +320,9 @@ class PbrMeshRenderer:
                     out_dict.normal = -gb_cam_normal * 0.5 + 0.5
                     mask = (rast[0, ..., -1:] > 0).float()
                     out_dict.mask = mask
+                    if self.rendering_options.get("return_geometry_buffers", False):
+                        out_dict.depth = gb_depth
+                        out_dict.position = pos
                 
                 # PBR attributes
                 if isinstance(mesh, MeshWithVoxel):

@@ -300,6 +300,12 @@ Higher-resolution fine-tuning can be performed by updating the `finetune_ckpt` f
 * `slat_flow_img2shape_dit_1_3B_512_bf16_ft1024.json`
 * `slat_flow_imgshape2tex_dit_1_3B_512_bf16_ft1024.json`
 
+### GPT Image Teacher Texture LoRA
+
+This fork also includes an experimental workflow for improving TRELLIS.2 texture generation with GPT Image teacher repairs. It builds a self-generated 512-resolution teacher dataset from input/reference images, sends multi-view albedo and optional normal-map renders to GPT Image 2, projects repaired albedo views back into PBR voxels, encodes teacher texture latents, and trains an adapter-only LoRA for `tex_slat_flow_model_512`.
+
+See [TEACHER_TEXTURE_LORA_README.md](TEACHER_TEXTURE_LORA_README.md) for dataset preparation, dry-run checks, LoRA training, resume, adapter application, and evaluation commands.
+
 
 ## 🧩 Related Packages
 

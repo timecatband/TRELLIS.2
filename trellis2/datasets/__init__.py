@@ -14,6 +14,7 @@ __attributes = {
     'ImageConditionedSLatShape': 'structured_latent_shape',
     'SLatPbr': 'structured_latent_svpbr',
     'ImageConditionedSLatPbr': 'structured_latent_svpbr',
+    'ImageConditionedTeacherSLatPbr': 'teacher_slat_pbr',
 }
 
 __submodules = []
@@ -43,4 +44,5 @@ if __name__ == '__main__':
     from .structured_latent import SLat, ImageConditionedSLat
     from .structured_latent_shape import SLatShape, ImageConditionedSLatShape
     from .structured_latent_svpbr import SLatPbr, ImageConditionedSLatPbr
+    from .teacher_slat_pbr import ImageConditionedTeacherSLatPbr
     

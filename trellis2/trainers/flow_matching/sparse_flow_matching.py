@@ -205,6 +205,123 @@ class SparseFlowMatchingCFGTrainer(ClassifierFreeGuidanceMixin, SparseFlowMatchi
     pass
 
 
+class TeacherSparseFlowMatchingTrainer(SparseFlowMatchingTrainer):
+    """
+    Sparse flow matching trainer with optional per-token teacher weights.
+    """
+
+    def __init__(
+        self,
+        *args,
+        normalize_loss_weights: bool = True,
+        lora_save_adapters: bool = False,
+        lora_save_full_checkpoint: bool = False,
+        lora_config: Optional[dict] = None,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.normalize_loss_weights = normalize_loss_weights
+        self.lora_save_adapters = lora_save_adapters
+        self.lora_save_full_checkpoint = lora_save_full_checkpoint
+        self.lora_config = lora_config or {}
+
+    def training_losses(
+        self,
+        x_0: sp.SparseTensor,
+        cond=None,
+        loss_weight: Optional[sp.SparseTensor] = None,
+        **kwargs
+    ) -> Tuple[Dict, Dict]:
+        noise = x_0.replace(torch.randn_like(x_0.feats))
+        t = self.sample_t(x_0.shape[0]).to(x_0.device).float()
+        x_t = self.diffuse(x_0, t, noise=noise)
+        cond = self.get_cond(cond, **kwargs)
+
+        pred = self.training_models['denoiser'](x_t, t * 1000, cond, **kwargs)
+        assert pred.shape == noise.shape == x_0.shape
+        target = self.get_v(x_0, noise, t)
+
+        sq_error = (pred.feats.float() - target.feats.float()).pow(2)
+        terms = edict()
+        terms["mse_unweighted"] = sq_error.mean()
+
+        if loss_weight is not None:
+            weights = loss_weight.feats.to(device=sq_error.device, dtype=sq_error.dtype)
+            if weights.shape[-1] == 1 and sq_error.shape[-1] != 1:
+                weights = weights.expand_as(sq_error)
+            weighted = sq_error * weights
+            if self.normalize_loss_weights:
+                terms["mse"] = weighted.sum() / weights.sum().clamp_min(1e-8)
+            else:
+                terms["mse"] = weighted.mean()
+            terms["teacher_weight_mean"] = weights.mean()
+            terms["teacher_weight_max"] = weights.max()
+        else:
+            weights = None
+            terms["mse"] = terms["mse_unweighted"]
+
+        terms["loss"] = terms["mse"]
+        observed_mask = None
+        if weights is not None:
+            token_weights = loss_weight.feats.to(device=sq_error.device, dtype=sq_error.dtype)
+            observed_mask = token_weights[:, 0] > 1.0001
+            terms["teacher_token_fraction"] = observed_mask.float().mean()
+            if observed_mask.any():
+                terms["mse_teacher_tokens"] = sq_error[observed_mask].mean()
+            if (~observed_mask).any():
+                terms["mse_base_tokens"] = sq_error[~observed_mask].mean()
+
+        mse_per_instance = []
+        weighted_mse_per_instance = []
+        teacher_fraction_per_instance = []
+        for i in range(x_0.shape[0]):
+            sl = x_0.layout[i]
+            mse_per_instance.append(sq_error[sl].mean().item())
+            if weights is not None:
+                weighted_mse_per_instance.append(
+                    (sq_error[sl] * weights[sl]).sum().div(weights[sl].sum().clamp_min(1e-8)).item()
+                )
+                teacher_fraction_per_instance.append(observed_mask[sl].float().mean().item())
+        mse_per_instance = np.array(mse_per_instance)
+        weighted_mse_per_instance = np.array(weighted_mse_per_instance) if weighted_mse_per_instance else mse_per_instance
+        teacher_fraction_per_instance = np.array(teacher_fraction_per_instance) if teacher_fraction_per_instance else None
+        time_bin = np.digitize(t.cpu().numpy(), np.linspace(0, 1, 11)) - 1
+        for i in range(10):
+            if (time_bin == i).sum() != 0:
+                terms[f"bin_{i}"] = {
+                    "mse": weighted_mse_per_instance[time_bin == i].mean(),
+                    "mse_unweighted": mse_per_instance[time_bin == i].mean(),
+                }
+                if teacher_fraction_per_instance is not None:
+                    terms[f"bin_{i}"]["teacher_token_fraction"] = teacher_fraction_per_instance[time_bin == i].mean()
+
+        return terms, {}
+
+    def save(self, non_blocking=True):
+        if self.lora_save_full_checkpoint:
+            super().save(non_blocking=non_blocking)
+        if not self.lora_save_adapters or not self.is_master:
+            return
+        from ...utils.lora_utils import save_lora_checkpoint
+
+        path = os.path.join(self.output_dir, 'lora', f'adapters_step{self.step:07d}.pt')
+        save_lora_checkpoint(
+            self.models,
+            path,
+            step=self.step,
+            lora_config=self.lora_config,
+        )
+        print(f'\nSaved LoRA adapter checkpoint to {path}')
+
+
+class TeacherSparseFlowMatchingCFGTrainer(ClassifierFreeGuidanceMixin, TeacherSparseFlowMatchingTrainer):
+    pass
+
+
+class ImageConditionedTeacherSparseFlowMatchingCFGTrainer(ImageConditionedMixin, TeacherSparseFlowMatchingCFGTrainer):
+    pass
+
+
 class TextConditionedSparseFlowMatchingCFGTrainer(TextConditionedMixin, SparseFlowMatchingCFGTrainer):
     """
     Trainer for sparse text-conditioned diffusion model with flow matching objective and classifier-free guidance.
