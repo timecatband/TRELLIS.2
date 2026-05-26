@@ -151,6 +151,31 @@ def sanitize_id(value: str) -> str:
     return value[:160] or hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
+def resolve_openai_api_key(args, require: bool = False) -> Optional[str]:
+    source = "--openai_api_key" if args.openai_api_key is not None else "OPENAI_API_KEY"
+    raw_key = args.openai_api_key if args.openai_api_key is not None else os.environ.get("OPENAI_API_KEY")
+    if raw_key is None:
+        if require:
+            raise RuntimeError("Set OPENAI_API_KEY or pass --openai_api_key unless using --skip_teacher.")
+        return None
+
+    key = raw_key.strip()
+    if not key:
+        if require:
+            raise RuntimeError(f"OpenAI API key from {source} is empty after trimming whitespace.")
+        return None
+
+    if any(char.isspace() for char in key):
+        raise RuntimeError(
+            f"OpenAI API key from {source} contains whitespace. Re-export it without spaces or newlines."
+        )
+    if key.endswith("%"):
+        raise RuntimeError(
+            f"OpenAI API key from {source} ends with '%', which usually means a shell prompt was copied with it."
+        )
+    return key
+
+
 def read_inputs(args) -> List[InputRecord]:
     records = []
     if args.input_manifest:
@@ -372,7 +397,7 @@ def call_gpt_image_teacher(
     except ImportError as exc:
         raise RuntimeError("Install the openai package or pass --skip_teacher for a dry run") from exc
 
-    client = OpenAI(api_key=args.openai_api_key or None)
+    client = OpenAI(api_key=resolve_openai_api_key(args, require=True))
     with ExitStack() as stack:
         image_file = stack.enter_context(open(input_path, "rb"))
         image_input = [image_file]
@@ -1099,6 +1124,8 @@ def parse_args():
 def main():
     run_start = time.time()
     args = parse_args()
+    if not args.skip_teacher:
+        args.openai_api_key = resolve_openai_api_key(args, require=True)
     ensure_dirs(args.output_dir, args.shape_latent_name, args.teacher_latent_name)
     logger = setup_logging(args.output_dir, args.verbose)
     records = read_inputs(args)
