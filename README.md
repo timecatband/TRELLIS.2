@@ -166,6 +166,7 @@ glb = o_voxel.postprocess.to_glb(
     solidify            =   False,
     solidify_resolution =   256,
     solidify_project_back = True,
+    solidify_fill_mode = "auto",
     verbose             =   True
 )
 glb.export("sample.glb", extension_webp=True)

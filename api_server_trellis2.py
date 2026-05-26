@@ -130,6 +130,7 @@ def remesh(
     solidify_max_voxels: int = 256 ** 3,
     solidify_project_back: bool = True,
     solidify_project_distance_voxels: float = 2.5,
+    solidify_fill_mode: str = "auto",
     verbose: bool = False,
 ):
     """
@@ -172,6 +173,7 @@ def remesh(
             max_voxels=solidify_max_voxels,
             project_back=solidify_project_back,
             project_distance_voxels=solidify_project_distance_voxels,
+            fill_mode=solidify_fill_mode,
             verbose=verbose,
         )
 
@@ -294,7 +296,8 @@ class Trellis2Worker:
                  printable_shell_dilation: int = 1,
                  printable_max_voxels: int = 256 ** 3,
                  printable_project_back: bool = True,
-                 printable_project_distance_voxels: float = 2.5):
+                 printable_project_distance_voxels: float = 2.5,
+                 printable_fill_mode: str = "auto"):
         self.worker_id = worker_id
         self.device = device
         self.seed = seed
@@ -309,6 +312,7 @@ class Trellis2Worker:
         self.printable_max_voxels = printable_max_voxels
         self.printable_project_back = printable_project_back
         self.printable_project_distance_voxels = printable_project_distance_voxels
+        self.printable_fill_mode = printable_fill_mode
         
         # Job tracking
         self.job_tracker = JobTracker()
@@ -562,6 +566,7 @@ class Trellis2Worker:
             solidify_max_voxels=self.printable_max_voxels,
             solidify_project_back=self.printable_project_back,
             solidify_project_distance_voxels=self.printable_project_distance_voxels,
+            solidify_fill_mode=self.printable_fill_mode,
             verbose=True
         )
 
@@ -689,6 +694,7 @@ class Trellis2Worker:
                 solidify_max_voxels=self.printable_max_voxels,
                 solidify_project_back=self.printable_project_back,
                 solidify_project_distance_voxels=self.printable_project_distance_voxels,
+                solidify_fill_mode=self.printable_fill_mode,
                 verbose=True
             )
             glb.export(texture_output_path, extension_webp=False)
@@ -939,6 +945,7 @@ Example usage:
         printable_max_voxels=export_config.get('printable_max_voxels', 256 ** 3),
         printable_project_back=export_config.get('printable_project_back', True),
         printable_project_distance_voxels=export_config.get('printable_project_distance_voxels', 2.5),
+        printable_fill_mode=export_config.get('printable_fill_mode', "auto"),
     )
     
     # Start periodic cleanup of old jobs

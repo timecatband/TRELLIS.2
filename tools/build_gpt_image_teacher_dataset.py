@@ -33,32 +33,50 @@ from trellis2.utils.random_utils import sphere_hammersley_sequence
 from trellis2.utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
 
 
-DEFAULT_TEACHER_PROMPT = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
-Generate a new improved albedo/base-color image only: sharper, more coherent texture detail, but still pixel-aligned to the first image.
-Preserve silhouette, camera viewpoint, object boundaries, geometry, material identity, and colors.
-Do not add text, background, new parts, lighting effects, shadows, or view changes.
+DEFAULT_TEACHER_PROMPT = """Use the first input image as the locked camera projection of a generated 3D asset view.
+Generate a repaired albedo/base-color image on the exact same square canvas.
+Only repaint colors and texture details of pixels that already belong to the visible object.
+The output must stay pixel-aligned to the first image so it can be projected back onto the same 3D surface.
+Preserve the exact silhouette, mask, camera viewpoint, crop, scale, perspective, pose, object boundaries, geometry, material identity, and visible part layout.
+Do not rotate, tilt, zoom, recenter, reshape, relight, add shadows, add highlights, add text, add background, add new parts, remove parts, change the angle, or change the camera.
+If a detail would require changing geometry, pose, or viewpoint, omit that detail.
+Keep non-object/background pixels unchanged from the first image.
 Return only the repaired albedo/base-color view."""
 
-DEFAULT_TEACHER_PROMPT_WITH_SOURCE = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
-Use the second input image as the original source/reference image that the 3D asset was generated from.
-Generate a new improved albedo/base-color image only: make the visible texture look more like the source/reference image while staying pixel-aligned to the generated render.
-Preserve the generated render's silhouette, camera viewpoint, object boundaries, geometry, and visible part layout.
-Do not add text, background, new parts, lighting effects, shadows, geometry changes, or view changes.
+DEFAULT_TEACHER_PROMPT_WITH_SOURCE = """Use the first input image as the locked camera projection of a generated 3D asset view.
+Use the second input image only as a style/content reference for color and texture details.
+Generate a repaired albedo/base-color image on the exact same square canvas.
+Only repaint colors and texture details of pixels that already belong to the visible object, making them more faithful to the source/reference where possible.
+The output must stay pixel-aligned to the first image so it can be projected back onto the same 3D surface.
+Preserve the generated render's exact silhouette, mask, camera viewpoint, crop, scale, perspective, pose, object boundaries, geometry, material identity, and visible part layout.
+Do not rotate, tilt, zoom, recenter, reshape, relight, add shadows, add highlights, add text, add background, add new parts, remove parts, change the angle, or change the camera.
+Do not copy source-image geometry, pose, perspective, or unseen parts if they conflict with the first image.
+If a source detail would require changing geometry, pose, or viewpoint, omit that detail.
+Keep non-object/background pixels unchanged from the first image.
 Return only the repaired albedo/base-color view."""
 
-DEFAULT_TEACHER_PROMPT_WITH_NORMAL = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
-Use the second input image as a camera-space normal map that defines the exact visible geometry.
-Generate a new improved albedo/base-color image only: sharper, more coherent texture detail, but still pixel-aligned to the first image and geometrically consistent with the normal map.
-Preserve silhouette, camera viewpoint, object boundaries, material identity, and colors.
-Do not add text, background, new parts, lighting effects, shadows, geometry changes, or normal-map colors.
+DEFAULT_TEACHER_PROMPT_WITH_NORMAL = """Use the first input image as the locked camera projection of a generated 3D asset view.
+Use the second input image as a camera-space normal map that defines the exact visible geometry and pixel layout.
+Generate a repaired albedo/base-color image on the exact same square canvas.
+Only repaint colors and texture details of pixels that already belong to the visible object.
+The output must stay pixel-aligned to the first image and geometrically consistent with the normal map so it can be projected back onto the same 3D surface.
+Preserve the exact silhouette, mask, camera viewpoint, crop, scale, perspective, pose, object boundaries, geometry, material identity, and visible part layout.
+Do not rotate, tilt, zoom, recenter, reshape, relight, add shadows, add highlights, add text, add background, add new parts, remove parts, change the angle, change the camera, or use normal-map colors.
+If a detail would require changing geometry, pose, or viewpoint, omit that detail.
+Keep non-object/background pixels unchanged from the first image.
 Return only the repaired albedo/base-color view."""
 
-DEFAULT_TEACHER_PROMPT_WITH_NORMAL_AND_SOURCE = """Use the first input image as the current albedo/base-color render of a generated 3D asset view.
-Use the second input image as a camera-space normal map that defines the exact visible geometry.
-Use the third input image as the original source/reference image that the 3D asset was generated from.
-Generate a new improved albedo/base-color image only: make the visible texture look more like the source/reference image while staying pixel-aligned to the generated render and geometrically consistent with the normal map.
-Preserve the generated render's silhouette, camera viewpoint, object boundaries, geometry, and visible part layout.
-Do not add text, background, new parts, lighting effects, shadows, geometry changes, normal-map colors, or view changes.
+DEFAULT_TEACHER_PROMPT_WITH_NORMAL_AND_SOURCE = """Use the first input image as the locked camera projection of a generated 3D asset view.
+Use the second input image as a camera-space normal map that defines the exact visible geometry and pixel layout.
+Use the third input image only as a style/content reference for color and texture details.
+Generate a repaired albedo/base-color image on the exact same square canvas.
+Only repaint colors and texture details of pixels that already belong to the visible object, making them more faithful to the source/reference where possible.
+The output must stay pixel-aligned to the first image and geometrically consistent with the normal map so it can be projected back onto the same 3D surface.
+Preserve the generated render's exact silhouette, mask, camera viewpoint, crop, scale, perspective, pose, object boundaries, geometry, material identity, and visible part layout.
+Do not rotate, tilt, zoom, recenter, reshape, relight, add shadows, add highlights, add text, add background, add new parts, remove parts, change the angle, change the camera, or use normal-map colors.
+Do not copy source-image geometry, pose, perspective, or unseen parts if they conflict with the first image.
+If a source detail would require changing geometry, pose, or viewpoint, omit that detail.
+Keep non-object/background pixels unchanged from the first image.
 Return only the repaired albedo/base-color view."""
 
 try:
@@ -438,25 +456,140 @@ def call_gpt_image_teacher(
         raise RuntimeError("Teacher image response did not include b64_json")
 
 
+def as_1hw(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim == 2:
+        return tensor.unsqueeze(0)
+    if tensor.ndim == 3:
+        return tensor[:1] if tensor.shape[0] != 1 else tensor
+    raise ValueError(f"Expected a 2D or 3D tensor, got shape {tuple(tensor.shape)}")
+
+
+def dilate_mask(mask: torch.Tensor, radius_px: int) -> torch.Tensor:
+    mask = as_1hw(mask).float().clamp(0, 1)
+    radius_px = int(max(0, radius_px))
+    if radius_px == 0:
+        return mask
+    kernel_size = radius_px * 2 + 1
+    return F.max_pool2d(mask.unsqueeze(0), kernel_size, stride=1, padding=radius_px)[0]
+
+
+def estimate_background_color(rgb: torch.Tensor, original_mask: torch.Tensor) -> torch.Tensor:
+    h, w = rgb.shape[-2:]
+    mask = as_1hw(original_mask).float().clamp(0, 1)
+    outside = mask[0] <= 0.05
+    min_candidates = max(64, int(0.01 * h * w))
+
+    if int(outside.sum().item()) < min_candidates:
+        border = torch.zeros((h, w), dtype=torch.bool, device=rgb.device)
+        border[0, :] = True
+        border[-1, :] = True
+        border[:, 0] = True
+        border[:, -1] = True
+        candidates = border
+    else:
+        candidates = outside
+
+    pixels = rgb.permute(1, 2, 0)[candidates]
+    if pixels.numel() == 0:
+        return torch.zeros((3, 1, 1), dtype=rgb.dtype, device=rgb.device)
+    return pixels.median(dim=0).values.reshape(3, 1, 1)
+
+
+def infer_teacher_foreground_mask(
+    teacher_rgb: torch.Tensor,
+    original_mask: torch.Tensor,
+    args,
+) -> Tuple[torch.Tensor, bool, float]:
+    mask = as_1hw(original_mask).float().clamp(0, 1)
+    background = estimate_background_color(teacher_rgb, mask)
+    distance = (teacher_rgb - background).abs().mean(dim=0, keepdim=True)
+    teacher_mask = (distance > float(args.teacher_mask_threshold)).float()
+
+    teacher_area = float(teacher_mask.mean().item())
+    original_area = float((mask > 0.5).float().mean().item())
+    min_area = max(0.002, original_area * 0.25)
+    max_area = min(0.98, original_area + 0.35)
+    reliable = min_area <= teacher_area <= max_area
+    return teacher_mask, reliable, teacher_area
+
+
+def threshold_score(value: float, limit: float) -> float:
+    if limit <= 0:
+        return 1.0 if value <= 0 else 0.0
+    return max(0.0, min(1.0, 1.0 - value / limit))
+
+
 def image_alignment_score(original_rgb: torch.Tensor, original_mask: torch.Tensor, teacher: Image.Image, args):
-    teacher_rgba = pil_to_chw(teacher.resize((original_rgb.shape[-1], original_rgb.shape[-2])), include_alpha=True)
+    target_size = (original_rgb.shape[-1], original_rgb.shape[-2])
+    teacher_rgba_image = teacher.convert("RGBA").resize(target_size, RESAMPLE_LANCZOS)
+    teacher_rgba = pil_to_chw(teacher_rgba_image, include_alpha=True)
     teacher_rgb = teacher_rgba[:3]
     teacher_alpha = teacher_rgba[3:4]
-    teacher_has_alpha = teacher.mode == "RGBA" and np.any(np.array(teacher.getchannel("A")) < 250)
+    teacher_has_alpha = bool(np.any(np.array(teacher_rgba_image.getchannel("A")) < 250))
 
-    mask = original_mask.float().clamp(0, 1).unsqueeze(0) if original_mask.ndim == 2 else original_mask.float().clamp(0, 1)
+    mask = as_1hw(original_mask).float().clamp(0, 1)
+    mask_bool = (mask > 0.5).float()
+
     if teacher_has_alpha:
-        inter = torch.minimum(mask, teacher_alpha).sum()
-        union = torch.maximum(mask, teacher_alpha).sum().clamp_min(1e-8)
-        iou = (inter / union).item()
+        teacher_mask = (teacher_alpha > float(args.teacher_alpha_threshold)).float()
+        teacher_mask_reliable = True
+        teacher_mask_area = float(teacher_mask.mean().item())
+    else:
+        teacher_mask, teacher_mask_reliable, teacher_mask_area = infer_teacher_foreground_mask(
+            teacher_rgb,
+            mask,
+            args,
+        )
+
+    if teacher_mask_reliable:
+        inter = torch.minimum(mask_bool, teacher_mask).sum()
+        union = torch.maximum(mask_bool, teacher_mask).sum().clamp_min(1e-8)
+        iou = float((inter / union).item())
     else:
         iou = 1.0
 
+    tolerance_mask = dilate_mask(mask, int(args.teacher_mask_tolerance_px))
+    outside_tolerance = (1.0 - tolerance_mask).clamp(0, 1)
+    outside_tolerance_sum = outside_tolerance.sum().clamp_min(1e-8)
+    has_outside_tolerance = float(outside_tolerance_sum.item()) > 1e-8
+    if teacher_mask_reliable and has_outside_tolerance:
+        mask_leakage = float((teacher_mask * outside_tolerance).sum().div(outside_tolerance_sum).item())
+    else:
+        mask_leakage = 0.0
+
+    if teacher_has_alpha or not has_outside_tolerance:
+        background_delta = 0.0
+    else:
+        background_delta = float(
+            (teacher_rgb - original_rgb).abs().mean(dim=0, keepdim=True).mul(outside_tolerance).sum()
+            .div(outside_tolerance_sum)
+            .item()
+        )
+
     delta = (teacher_rgb - original_rgb).abs().mul(mask).sum() / (mask.sum().clamp_min(1e-8) * 3)
     delta = float(delta.item())
-    accepted = iou >= args.min_mask_iou and delta <= args.max_teacher_delta
-    score = max(0.0, min(1.0, 1.0 - delta / max(args.max_teacher_delta, 1e-6))) * iou
-    return accepted, score, teacher_rgb, teacher_alpha
+    accepted = (
+        iou >= args.min_mask_iou
+        and delta <= args.max_teacher_delta
+        and background_delta <= args.max_teacher_background_delta
+        and mask_leakage <= args.max_teacher_mask_leakage
+    )
+    score = (
+        threshold_score(delta, args.max_teacher_delta)
+        * iou
+        * threshold_score(background_delta, args.max_teacher_background_delta)
+        * threshold_score(mask_leakage, args.max_teacher_mask_leakage)
+    )
+    metrics = {
+        "mean_delta": delta,
+        "mask_iou": iou,
+        "background_delta": background_delta,
+        "mask_leakage": mask_leakage,
+        "teacher_has_alpha": teacher_has_alpha,
+        "teacher_mask_reliable": bool(teacher_mask_reliable),
+        "teacher_mask_area": teacher_mask_area,
+    }
+    return accepted, score, teacher_rgb, teacher_alpha, metrics
 
 
 def save_teacher_view_intermediates(
@@ -562,6 +695,12 @@ def sample_chw(chw: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     return sampled[0, :, :, 0].transpose(0, 1)
 
 
+def projection_depth_tolerance(mesh, args) -> float:
+    if args.depth_tolerance is not None:
+        return float(args.depth_tolerance)
+    return float(mesh.voxel_size) * float(args.depth_tolerance_voxels)
+
+
 def project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, args, alignment_score: float):
     coords = mesh.coords.float().cuda()
     xyz = mesh.origin.to(coords.device) + (coords + 0.5) * mesh.voxel_size
@@ -581,8 +720,9 @@ def project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, a
 
     visible = in_frame.float().unsqueeze(1)
     if "depth" in buffers:
+        depth_tolerance = projection_depth_tolerance(mesh, args)
         depth = sample_chw(buffers["depth"].float(), grid)[:, :1]
-        visible = visible * (depth - z).abs().lt(args.depth_tolerance).float()
+        visible = visible * (depth - z).abs().lt(depth_tolerance).float()
 
     normal_conf = torch.ones_like(visible)
     if "normal" in buffers:
@@ -602,10 +742,13 @@ def fuse_teacher_views(mesh, projections, base_color_slice):
         numerator += rgb.to(attrs.dtype) * weight.to(attrs.dtype)
         denominator += weight.to(attrs.dtype)
     observed = denominator[:, 0] > 1e-6
+    confidence = denominator.clamp(0, 1)
     if observed.any():
-        attrs[observed, base_color_slice] = (numerator[observed] / denominator[observed].clamp_min(1e-6)).clamp(0, 1)
-    confidence = denominator / denominator.max().clamp_min(1e-6)
-    return attrs, confidence.clamp(0, 1)
+        teacher_base = (numerator[observed] / denominator[observed].clamp_min(1e-6)).clamp(0, 1)
+        blend = confidence[observed]
+        original_base = attrs[observed, base_color_slice]
+        attrs[observed, base_color_slice] = original_base * (1.0 - blend) + teacher_base * blend
+    return attrs, confidence
 
 
 def latent_weights_from_voxels(
@@ -858,11 +1001,28 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             view=view["index"],
         ):
             teacher = Image.open(teacher_path)
-            accepted, score, teacher_rgb, teacher_alpha = image_alignment_score(
+            accepted, score, teacher_rgb, teacher_alpha, alignment_metrics = image_alignment_score(
                 buffers["base_color"],
                 buffers["mask"],
                 teacher,
                 args,
+            )
+            logger.info(
+                (
+                    "teacher_alignment id=%s view=%s accepted=%s score=%.4f "
+                    "mean_delta=%.4f mask_iou=%.4f background_delta=%.4f mask_leakage=%.4f "
+                    "mask_reliable=%s has_alpha=%s"
+                ),
+                record.safe_id,
+                view["index"],
+                accepted,
+                score,
+                alignment_metrics["mean_delta"],
+                alignment_metrics["mask_iou"],
+                alignment_metrics["background_delta"],
+                alignment_metrics["mask_leakage"],
+                alignment_metrics["teacher_mask_reliable"],
+                alignment_metrics["teacher_has_alpha"],
             )
         if not args.no_save_intermediate_images:
             with progress_heartbeat(
@@ -884,6 +1044,7 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
                     accepted,
                     score,
                 )
+        projected_voxel_fraction = 0.0
         if accepted:
             with progress_heartbeat(
                 logger,
@@ -893,8 +1054,11 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
                 view=view["index"],
                 score=f"{score:.4f}",
                 voxels=int(mesh.coords.shape[0]),
+                depth_tolerance=f"{projection_depth_tolerance(mesh, args):.6f}",
             ):
-                projections.append(project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, args, score))
+                projection = project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, args, score)
+                projected_voxel_fraction = float((projection[1][:, 0] > 1e-6).float().mean().item())
+                projections.append(projection)
         else:
             logger.info(
                 "project_teacher_view_skipped id=%s view=%s accepted=%s score=%.4f",
@@ -909,16 +1073,25 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             "pitch": view["pitch"],
             "accepted": bool(accepted),
             "alignment_score": float(score),
+            "alignment_mean_delta": float(alignment_metrics["mean_delta"]),
+            "alignment_mask_iou": float(alignment_metrics["mask_iou"]),
+            "alignment_background_delta": float(alignment_metrics["background_delta"]),
+            "alignment_mask_leakage": float(alignment_metrics["mask_leakage"]),
+            "teacher_has_alpha": bool(alignment_metrics["teacher_has_alpha"]),
+            "teacher_mask_reliable": bool(alignment_metrics["teacher_mask_reliable"]),
+            "teacher_mask_area": float(alignment_metrics["teacher_mask_area"]),
+            "projected_voxel_fraction": projected_voxel_fraction,
             "normal_reference": bool(args.include_normal_reference),
             "source_reference": not bool(args.no_source_reference),
             "elapsed_sec": time.time() - view_start,
         })
         logger.info(
-            "view_done id=%s view=%s accepted=%s score=%.4f elapsed=%.1fs",
+            "view_done id=%s view=%s accepted=%s score=%.4f projected_voxel_fraction=%.4f elapsed=%.1fs",
             record.safe_id,
             view["index"],
             accepted,
             score,
+            projected_voxel_fraction,
             time.time() - view_start,
         )
 
@@ -1115,7 +1288,20 @@ def parse_args():
     parser.add_argument("--visible_weight", type=float, default=4.0)
     parser.add_argument("--min_mask_iou", type=float, default=0.9)
     parser.add_argument("--max_teacher_delta", type=float, default=0.65)
-    parser.add_argument("--depth_tolerance", type=float, default=0.04)
+    parser.add_argument("--max_teacher_background_delta", type=float, default=0.08,
+                        help="Reject opaque teacher outputs that alter pixels outside the original render mask by more than this mean RGB delta.")
+    parser.add_argument("--max_teacher_mask_leakage", type=float, default=0.02,
+                        help="Reject teacher outputs whose inferred/alpha foreground leaks outside the original mask by more than this outside-pixel fraction.")
+    parser.add_argument("--teacher_mask_threshold", type=float, default=0.08,
+                        help="RGB distance from estimated background used to infer a foreground mask when the teacher output is opaque.")
+    parser.add_argument("--teacher_alpha_threshold", type=float, default=0.5,
+                        help="Alpha cutoff used for teacher-output silhouette checks.")
+    parser.add_argument("--teacher_mask_tolerance_px", type=int, default=2,
+                        help="Pixel dilation around the original mask allowed before counting teacher foreground/background leakage.")
+    parser.add_argument("--depth_tolerance", type=float, default=None,
+                        help="Absolute camera-depth tolerance for projection. Overrides --depth_tolerance_voxels when set.")
+    parser.add_argument("--depth_tolerance_voxels", type=float, default=2.5,
+                        help="Default projection depth tolerance measured in output voxels.")
     parser.add_argument("--min_grazing_weight", type=float, default=0.15)
     parser.add_argument("--tex_sampling_steps", type=int, default=12)
     parser.add_argument("--tex_guidance_scale", type=float, default=7.5)

@@ -72,7 +72,8 @@ See `api_server_config_default.json` for the default configuration:
     "printable_shell_dilation": 1,
     "printable_max_voxels": 16777216,
     "printable_project_back": true,
-    "printable_project_distance_voxels": 2.5
+    "printable_project_distance_voxels": 2.5,
+    "printable_fill_mode": "auto"
   },
   "worker": {
     "limit_model_concurrency": 5,
@@ -113,6 +114,7 @@ See `api_server_config_default.json` for the default configuration:
 - `printable_max_voxels`: Safety cap for printable solidification memory use (default: 16,777,216)
 - `printable_project_back`: Projects the filled outer surface back to the generated source mesh to recover detail (default: true)
 - `printable_project_distance_voxels`: Maximum projection distance measured in solidification voxels (default: 2.5)
+- `printable_fill_mode`: Interior fill strategy. `auto` falls back to aggressive axis-span filling when flood-fill leaks; `flood` only fills watertight interiors; `aggressive` always uses the fallback (default: auto)
 
 #### Worker Section
 - `limit_model_concurrency`: Max concurrent requests (default: 5)

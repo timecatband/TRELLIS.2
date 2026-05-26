@@ -124,7 +124,16 @@ Controls how strongly teacher-observed latent tokens are weighted during trainin
 ```sh
 --min_mask_iou 0.9 --max_teacher_delta 0.65
 ```
-Filters teacher views that drift too far from the original silhouette/alignment.
+Filters teacher views that drift too far from the original silhouette/alignment. The builder also rejects opaque teacher outputs that change the background or leak inferred foreground outside the original render mask:
+
+```sh
+--max_teacher_background_delta 0.08 --max_teacher_mask_leakage 0.02
+```
+
+```sh
+--depth_tolerance_voxels 2.5
+```
+Controls projection/fusion strictness in voxel units. The old absolute world-space override is still available as `--depth_tolerance`, but leaving it unset is safer because the default now scales with the 512-grid voxel size.
 
 ## 3. Inspect Dataset Quality
 
@@ -143,14 +152,15 @@ Look for:
 - `teacher_accepted_views` should usually be at least `1`; higher is better.
 - `intermediate_images/<id>/view_*_gpt_compare.png` compares the source image, GPT input albedo, optional normal reference, mask, and GPT output.
 - `intermediate_images/<id>/view_*_projection_compare.png` compares GPT output against the fused albedo after projection back onto the asset.
-- Teacher images should preserve silhouette, viewpoint, and part boundaries.
+- Teacher images should preserve silhouette, viewpoint, crop, scale, and part boundaries.
 - Teacher images should move texture detail toward the original source image without changing the generated view geometry.
 - Normal-reference runs should improve alignment on high-curvature or detailed geometry.
 - Fused targets should not show obvious baked shadows or background colors.
+- Weak/grazing projections are blended with the original base color instead of hard-overwriting it; inspect `views.json` for per-view `projected_voxel_fraction` and alignment metrics when a view contributes little.
 
 Use `--no_save_intermediate_images` only when you want a lean latent-only run and do not need visual inspection files. With `--skip_existing`, a record is treated as complete only after both the teacher latent and `intermediate_images/<id>/summary.png` exist, unless intermediate image saving is disabled.
 
-If too many views are rejected, loosen `--min_mask_iou` slightly or improve the teacher prompt. If teacher images change geometry, tighten the prompt or use `--include_normal_reference`.
+If too many views are rejected, loosen `--min_mask_iou`, `--max_teacher_background_delta`, or `--max_teacher_mask_leakage` slightly. If teacher images change geometry, use `--include_normal_reference` and keep the default strict prompt.
 
 Builder observability:
 
@@ -314,9 +324,9 @@ python tools/eval_texture_lora.py \
 ## Debugging Checklist
 
 - Dataset build stops early: rerun with `--keep_going`, then inspect `logs/failures.jsonl`.
-- Teacher edits look misaligned: enable `--include_normal_reference`, inspect `renders/<id>/*_normal.png`, and tighten the prompt.
+- Teacher edits look misaligned: enable `--include_normal_reference`, inspect `renders/<id>/*_normal.png`, and tighten `--min_mask_iou`, `--max_teacher_background_delta`, or `--max_teacher_mask_leakage`.
 - Teacher edits look generic or unlike the input: confirm you did not pass `--no_source_reference`, inspect `source_images/<id>.png`, and make sure the input image is clean enough to serve as a reference.
 - Too many rejected views: compare `renders/<id>/*_base_color.png` to `teacher_views/<id>/*_teacher.png`, then tune `--min_mask_iou` and `--max_teacher_delta`.
-- Low projected coverage: increase `--num_views`, inspect `teacher_projected_voxel_fraction`, and check whether depth/mask renders look correct.
+- Low projected coverage: increase `--num_views`, inspect `teacher_projected_voxel_fraction`, and check whether depth/mask renders look correct. If the fused textures look smeared through the asset, keep `--depth_tolerance` unset and tune `--depth_tolerance_voxels` instead.
 - Training loss is noisy: reduce `--lr`, reduce `--visible_weight`, or start with a smaller pilot dataset and inspect `mse_teacher_tokens` vs `mse_base_tokens`.
 - Adapter has no visible effect: confirm `logs/lora_summary.json` has nonzero `wrapped_modules` and `trainable_params`, then evaluate at the same seeds used for the baseline.

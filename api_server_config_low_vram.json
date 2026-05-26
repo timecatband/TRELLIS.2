@@ -29,7 +29,8 @@
     "printable_shell_dilation": 1,
     "printable_max_voxels": 7077888,
     "printable_project_back": true,
-    "printable_project_distance_voxels": 2.5
+    "printable_project_distance_voxels": 2.5,
+    "printable_fill_mode": "auto"
   },
   "worker": {
     "limit_model_concurrency": 5,

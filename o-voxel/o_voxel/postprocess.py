@@ -97,6 +97,41 @@ def _fill_enclosed_voxels(occupied: np.ndarray) -> np.ndarray:
     return ~exterior
 
 
+def _span_fill_along_axis(occupied: np.ndarray, axis: int) -> np.ndarray:
+    moved = np.moveaxis(occupied.astype(bool, copy=False), axis, 0)
+    any_occupied = moved.any(axis=0)
+    first = np.argmax(moved, axis=0)
+    last = moved.shape[0] - 1 - np.argmax(moved[::-1], axis=0)
+    line = np.arange(moved.shape[0]).reshape((-1,) + (1,) * (moved.ndim - 1))
+    filled = any_occupied.reshape((1,) + any_occupied.shape) & (line >= first) & (line <= last)
+    return np.moveaxis(filled, 0, axis)
+
+
+def _axis_span_fill_voxels(occupied: np.ndarray, min_axis_votes: int = 2) -> np.ndarray:
+    """Fill voxels that lie between surface hits along multiple principal axes."""
+    spans = [_span_fill_along_axis(occupied, axis) for axis in range(3)]
+    return (spans[0].astype(np.uint8) + spans[1].astype(np.uint8) + spans[2].astype(np.uint8)) >= min_axis_votes
+
+
+def _solid_fill_voxels(surface: np.ndarray, mode: str = "auto") -> np.ndarray:
+    mode = (mode or "auto").lower()
+    flood_filled = _fill_enclosed_voxels(surface)
+    if mode == "flood":
+        return flood_filled
+
+    axis_filled = _axis_span_fill_voxels(surface, min_axis_votes=2)
+    if mode in {"axis", "aggressive", "span"}:
+        return flood_filled | axis_filled
+
+    if mode == "auto":
+        surface_count = max(1, int(surface.sum()))
+        if int(flood_filled.sum()) < surface_count * 1.5:
+            return flood_filled | axis_filled
+        return flood_filled
+
+    raise ValueError(f"Unsupported printable solid fill mode: {mode}")
+
+
 def _boundary_mesh_from_voxels(
     voxels: np.ndarray,
     transform: np.ndarray,
@@ -242,6 +277,7 @@ def solidify_mesh_for_printing(
     max_voxels: int = 256 ** 3,
     project_back: bool = True,
     project_distance_voxels: float = 2.5,
+    fill_mode: str = "auto",
     verbose: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -277,7 +313,7 @@ def solidify_mesh_for_printing(
     if shell_dilation > 0:
         surface = _binary_dilate_6(surface, shell_dilation)
 
-    filled = _fill_enclosed_voxels(surface)
+    filled = _solid_fill_voxels(surface, mode=fill_mode)
     solid_mesh = _boundary_mesh_from_voxels(
         filled,
         voxel_grid.transform,
@@ -335,6 +371,7 @@ def to_glb(
     solidify_max_voxels: int = 256 ** 3,
     solidify_project_back: bool = True,
     solidify_project_distance_voxels: float = 2.5,
+    solidify_fill_mode: str = "auto",
     mesh_cluster_threshold_cone_half_angle_rad=np.radians(90.0),
     mesh_cluster_refine_iterations=0,
     mesh_cluster_global_iterations=1,
@@ -366,6 +403,7 @@ def to_glb(
         solidify_max_voxels: safety cap for CPU solidification grid size
         solidify_project_back: project the solid outer surface back to the source mesh for detail recovery
         solidify_project_distance_voxels: maximum projection distance measured in solidification voxels
+        solidify_fill_mode: solid fill mode, one of "auto", "flood", or "aggressive"
         mesh_cluster_threshold_cone_half_angle_rad: threshold for cone-based clustering in uv unwrapping
         mesh_cluster_refine_iterations: number of iterations for refining clusters in uv unwrapping
         mesh_cluster_global_iterations: number of global iterations for clustering in uv unwrapping
@@ -437,6 +475,7 @@ def to_glb(
             max_voxels=solidify_max_voxels,
             project_back=solidify_project_back,
             project_distance_voxels=solidify_project_distance_voxels,
+            fill_mode=solidify_fill_mode,
             verbose=verbose,
         )
         _log("solidify_for_printing")
@@ -743,6 +782,7 @@ def remesh(
     solidify_max_voxels: int = 256 ** 3,
     solidify_project_back: bool = True,
     solidify_project_distance_voxels: float = 2.5,
+    solidify_fill_mode: str = "auto",
     verbose: bool = False,
 ):
     """
@@ -785,6 +825,7 @@ def remesh(
             max_voxels=solidify_max_voxels,
             project_back=solidify_project_back,
             project_distance_voxels=solidify_project_distance_voxels,
+            fill_mode=solidify_fill_mode,
             verbose=verbose,
         )
 
