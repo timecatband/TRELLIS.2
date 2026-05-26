@@ -23,7 +23,7 @@
   },
   "export": {
     "glb_decimation_target": 250000,
-    "glb_texture_size": 2048
+    "glb_texture_size": 2048,
     "make_printable": false,
     "printable_resolution": 192,
     "printable_shell_dilation": 1,
