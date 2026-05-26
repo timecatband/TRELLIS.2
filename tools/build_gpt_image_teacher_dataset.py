@@ -10,8 +10,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -81,9 +82,10 @@ def setup_logging(output_dir: str, verbose: bool = False):
     logger = logging.getLogger("teacher_dataset")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
+    logger.propagate = False
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    stream = logging.StreamHandler()
+    stream = logging.StreamHandler(sys.stdout)
     stream.setLevel(logging.DEBUG if verbose else logging.INFO)
     stream.setFormatter(formatter)
     logger.addHandler(stream)
@@ -93,6 +95,49 @@ def setup_logging(output_dir: str, verbose: bool = False):
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     return logger
+
+
+def format_log_fields(fields: Dict[str, object]) -> str:
+    pairs = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        pairs.append(f"{key}={value}")
+    return (" " + " ".join(pairs)) if pairs else ""
+
+
+@contextmanager
+def progress_heartbeat(logger, stage: str, *, every_sec: float = 30.0, **fields):
+    start_time = time.time()
+    field_text = format_log_fields(fields)
+    logger.info("%s_start%s", stage, field_text)
+
+    stop_event = threading.Event()
+    thread = None
+    if every_sec and every_sec > 0:
+        def log_waiting():
+            while not stop_event.wait(every_sec):
+                logger.info(
+                    "%s_waiting elapsed=%.1fs%s",
+                    stage,
+                    time.time() - start_time,
+                    field_text,
+                )
+
+        thread = threading.Thread(target=log_waiting, daemon=True)
+        thread.start()
+
+    try:
+        yield
+    except Exception:
+        logger.error("%s_failed elapsed=%.1fs%s", stage, time.time() - start_time, field_text)
+        raise
+    else:
+        logger.info("%s_done elapsed=%.1fs%s", stage, time.time() - start_time, field_text)
+    finally:
+        stop_event.set()
+        if thread is not None:
+            thread.join(timeout=0.1)
 
 
 def append_jsonl(path: str, record: dict):
@@ -591,24 +636,39 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             final_latent_path,
         )
 
-    source = Image.open(record.image_path)
     source_save_path = os.path.join(out_dir, "source_images", f"{record.safe_id}.png")
-    source.save(source_save_path)
-    if not args.no_save_intermediate_images:
-        inspect_dir = intermediate_dir(out_dir, record.safe_id)
-        os.makedirs(inspect_dir, exist_ok=True)
-        source.save(os.path.join(inspect_dir, "source.png"))
+    with progress_heartbeat(
+        logger,
+        "source_prepare",
+        every_sec=args.progress_interval,
+        id=record.safe_id,
+        image=record.image_path,
+    ):
+        source = Image.open(record.image_path)
+        source.save(source_save_path)
+        if not args.no_save_intermediate_images:
+            inspect_dir = intermediate_dir(out_dir, record.safe_id)
+            os.makedirs(inspect_dir, exist_ok=True)
+            source.save(os.path.join(inspect_dir, "source.png"))
 
-    logger.info("generate_start id=%s seed=%s image=%s", record.safe_id, record.seed, record.image_path)
     try:
-        meshes, latents = pipeline.run(
-            source,
+        with progress_heartbeat(
+            logger,
+            "generate",
+            every_sec=args.progress_interval,
+            id=record.safe_id,
             seed=record.seed,
-            pipeline_type="512",
-            return_latent=True,
-            preprocess_image=not args.no_preprocess_image,
-            tex_slat_sampler_params={"steps": args.tex_sampling_steps, "guidance_strength": args.tex_guidance_scale},
-        )
+            tex_steps=args.tex_sampling_steps,
+            tex_guidance=args.tex_guidance_scale,
+        ):
+            meshes, latents = pipeline.run(
+                source,
+                seed=record.seed,
+                pipeline_type="512",
+                return_latent=True,
+                preprocess_image=not args.no_preprocess_image,
+                tex_slat_sampler_params={"steps": args.tex_sampling_steps, "guidance_strength": args.tex_guidance_scale},
+            )
     except Exception as exc:
         logger.exception("generate_failed id=%s", record.safe_id)
         append_jsonl(os.path.join(out_dir, "logs", "failures.jsonl"), {
@@ -620,25 +680,72 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             return None
         raise
     shape_slat, original_tex_slat, resolution = latents
-    mesh = meshes[0].to("cuda")
-
-    save_sparse(os.path.join(out_dir, "shape_latents", args.shape_latent_name, f"{record.safe_id}.npz"), shape_slat)
-    save_sparse(os.path.join(out_dir, "pbr_voxels", "original", f"{record.safe_id}.npz"), SparseTensor(
-        mesh.attrs.detach().cpu(),
-        torch.cat([torch.zeros_like(mesh.coords[:, :1]), mesh.coords.cpu()], dim=1),
-    ))
-    np.savez_compressed(
-        os.path.join(out_dir, "mesh_npz", f"{record.safe_id}.npz"),
-        vertices=mesh.vertices.detach().cpu().numpy().astype(np.float32),
-        faces=mesh.faces.detach().cpu().numpy().astype(np.int32),
+    logger.info(
+        "generate_result id=%s meshes=%s shape_tokens=%s tex_tokens=%s resolution=%s",
+        record.safe_id,
+        len(meshes),
+        int(shape_slat.coords.shape[0]),
+        int(original_tex_slat.coords.shape[0]),
+        resolution,
     )
+    with progress_heartbeat(
+        logger,
+        "mesh_to_cuda",
+        every_sec=args.progress_interval,
+        id=record.safe_id,
+        vertices=int(meshes[0].vertices.shape[0]),
+        faces=int(meshes[0].faces.shape[0]),
+    ):
+        mesh = meshes[0].to("cuda")
+
+    with progress_heartbeat(
+        logger,
+        "save_initial_artifacts",
+        every_sec=args.progress_interval,
+        id=record.safe_id,
+    ):
+        save_sparse(os.path.join(out_dir, "shape_latents", args.shape_latent_name, f"{record.safe_id}.npz"), shape_slat)
+        mesh_coords_cpu = mesh.coords.detach().cpu()
+        save_sparse(os.path.join(out_dir, "pbr_voxels", "original", f"{record.safe_id}.npz"), SparseTensor(
+            mesh.attrs.detach().cpu(),
+            torch.cat([torch.zeros_like(mesh_coords_cpu[:, :1]), mesh_coords_cpu], dim=1),
+        ))
+        np.savez_compressed(
+            os.path.join(out_dir, "mesh_npz", f"{record.safe_id}.npz"),
+            vertices=mesh.vertices.detach().cpu().numpy().astype(np.float32),
+            faces=mesh.faces.detach().cpu().numpy().astype(np.int32),
+        )
 
     views = get_teacher_views(args.num_views, args.radius, args.fov, tuple(args.view_offset))
+    logger.info(
+        "views_start id=%s total=%s radius=%.3f fov=%.3f render_resolution=%s",
+        record.safe_id,
+        len(views),
+        args.radius,
+        args.fov,
+        args.render_resolution,
+    )
     projections = []
     view_records = []
     for view in views:
         view_start = time.time()
-        buffers = render_view(renderer, envmap, mesh, view)
+        logger.info(
+            "view_start id=%s view=%s/%s yaw=%.4f pitch=%.4f",
+            record.safe_id,
+            int(view["index"]) + 1,
+            len(views),
+            view["yaw"],
+            view["pitch"],
+        )
+        with progress_heartbeat(
+            logger,
+            "render_view",
+            every_sec=args.progress_interval,
+            id=record.safe_id,
+            view=view["index"],
+            resolution=args.render_resolution,
+        ):
+            buffers = render_view(renderer, envmap, mesh, view)
         view_dir = os.path.join(out_dir, "teacher_views", record.safe_id)
         render_dir = os.path.join(out_dir, "renders", record.safe_id)
         os.makedirs(view_dir, exist_ok=True)
@@ -648,22 +755,50 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
         mask_path = os.path.join(render_dir, f"view_{view['index']:02d}_mask.png")
         normal_path = os.path.join(render_dir, f"view_{view['index']:02d}_normal.png")
         teacher_path = os.path.join(view_dir, f"view_{view['index']:02d}_teacher.png")
-        chw_to_pil(buffers["base_color"]).save(render_path)
-        chw_to_pil(buffers["mask"]).save(mask_path)
-        if args.include_normal_reference:
-            chw_to_pil(buffers["normal"]).save(normal_path)
-        else:
-            normal_path = None
+        with progress_heartbeat(
+            logger,
+            "save_view_inputs",
+            every_sec=args.progress_interval,
+            id=record.safe_id,
+            view=view["index"],
+        ):
+            chw_to_pil(buffers["base_color"]).save(render_path)
+            chw_to_pil(buffers["mask"]).save(mask_path)
+            if args.include_normal_reference:
+                chw_to_pil(buffers["normal"]).save(normal_path)
+            else:
+                normal_path = None
 
         source_reference_path = None if args.no_source_reference else source_save_path
         try:
-            call_gpt_image_teacher(
-                render_path,
-                teacher_path,
-                args,
-                normal_path=normal_path,
-                source_path=source_reference_path,
-            )
+            teacher_input_count = 1 + int(normal_path is not None) + int(source_reference_path is not None)
+            with progress_heartbeat(
+                logger,
+                "teacher_request",
+                every_sec=args.progress_interval,
+                id=record.safe_id,
+                view=view["index"],
+                model=args.teacher_model,
+                quality=args.teacher_quality,
+                size=args.teacher_size,
+                inputs=teacher_input_count,
+                skip_teacher=args.skip_teacher,
+            ):
+                call_gpt_image_teacher(
+                    render_path,
+                    teacher_path,
+                    args,
+                    normal_path=normal_path,
+                    source_path=source_reference_path,
+                )
+            if os.path.exists(teacher_path):
+                logger.info(
+                    "teacher_output_saved id=%s view=%s path=%s bytes=%s",
+                    record.safe_id,
+                    view["index"],
+                    teacher_path,
+                    os.path.getsize(teacher_path),
+                )
         except Exception as exc:
             logger.exception("teacher_failed id=%s view=%s", record.safe_id, view["index"])
             append_jsonl(os.path.join(out_dir, "logs", "failures.jsonl"), {
@@ -686,28 +821,59 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
                 })
                 continue
             raise
-        teacher = Image.open(teacher_path)
-        accepted, score, teacher_rgb, teacher_alpha = image_alignment_score(
-            buffers["base_color"],
-            buffers["mask"],
-            teacher,
-            args,
-        )
+        with progress_heartbeat(
+            logger,
+            "score_teacher_view",
+            every_sec=args.progress_interval,
+            id=record.safe_id,
+            view=view["index"],
+        ):
+            teacher = Image.open(teacher_path)
+            accepted, score, teacher_rgb, teacher_alpha = image_alignment_score(
+                buffers["base_color"],
+                buffers["mask"],
+                teacher,
+                args,
+            )
         if not args.no_save_intermediate_images:
-            save_teacher_view_intermediates(
-                out_dir,
-                record,
-                view,
-                source,
-                render_path,
-                mask_path,
-                normal_path,
-                teacher_path,
+            with progress_heartbeat(
+                logger,
+                "save_teacher_intermediates",
+                every_sec=args.progress_interval,
+                id=record.safe_id,
+                view=view["index"],
+            ):
+                save_teacher_view_intermediates(
+                    out_dir,
+                    record,
+                    view,
+                    source,
+                    render_path,
+                    mask_path,
+                    normal_path,
+                    teacher_path,
+                    accepted,
+                    score,
+                )
+        if accepted:
+            with progress_heartbeat(
+                logger,
+                "project_teacher_view",
+                every_sec=args.progress_interval,
+                id=record.safe_id,
+                view=view["index"],
+                score=f"{score:.4f}",
+                voxels=int(mesh.coords.shape[0]),
+            ):
+                projections.append(project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, args, score))
+        else:
+            logger.info(
+                "project_teacher_view_skipped id=%s view=%s accepted=%s score=%.4f",
+                record.safe_id,
+                view["index"],
                 accepted,
                 score,
             )
-        if accepted:
-            projections.append(project_teacher_to_voxels(mesh, teacher_rgb, teacher_alpha, buffers, view, args, score))
         view_records.append({
             "view_index": view["index"],
             "yaw": view["yaw"],
@@ -727,54 +893,103 @@ def process_record(record: InputRecord, pipeline, tex_encoder, renderer, envmap,
             time.time() - view_start,
         )
 
+    accepted_so_far = sum(1 for view in view_records if view["accepted"])
+    logger.info(
+        "views_done id=%s accepted_views=%s/%s projections=%s elapsed=%.1fs",
+        record.safe_id,
+        accepted_so_far,
+        len(view_records),
+        len(projections),
+        time.time() - start_time,
+    )
+
     if projections:
-        fused_attrs, voxel_conf = fuse_teacher_views(mesh, projections, mesh.layout["base_color"])
+        with progress_heartbeat(
+            logger,
+            "fuse_teacher_views",
+            every_sec=args.progress_interval,
+            id=record.safe_id,
+            projections=len(projections),
+            voxels=int(mesh.coords.shape[0]),
+        ):
+            fused_attrs, voxel_conf = fuse_teacher_views(mesh, projections, mesh.layout["base_color"])
     else:
+        logger.info("fuse_teacher_views_skipped id=%s reason=no_accepted_projections", record.safe_id)
         fused_attrs = mesh.attrs.detach().clone()
         voxel_conf = torch.zeros(mesh.attrs.shape[0], 1, dtype=mesh.attrs.dtype, device=mesh.attrs.device)
 
     if not args.no_save_intermediate_images:
-        save_fused_intermediates(
-            out_dir,
-            record,
-            mesh,
-            fused_attrs,
-            views,
-            view_records,
-            renderer,
-            envmap,
-            source,
-        )
+        with progress_heartbeat(
+            logger,
+            "save_fused_intermediates",
+            every_sec=args.progress_interval,
+            id=record.safe_id,
+            views=len(views),
+        ):
+            save_fused_intermediates(
+                out_dir,
+                record,
+                mesh,
+                fused_attrs,
+                views,
+                view_records,
+                renderer,
+                envmap,
+                source,
+            )
 
     fused_voxel = SparseTensor(
         feats=fused_attrs.detach().float() * 2.0 - 1.0,
         coords=torch.cat([torch.zeros_like(mesh.coords[:, :1]), mesh.coords], dim=1).int(),
     )
-    teacher_z = tex_encoder(fused_voxel.cuda())
-    teacher_z = align_sparse_like(teacher_z, original_tex_slat, fill=original_tex_slat.feats)
-    save_sparse(final_latent_path, teacher_z)
+    with progress_heartbeat(
+        logger,
+        "encode_teacher_latent",
+        every_sec=args.progress_interval,
+        id=record.safe_id,
+        voxels=int(mesh.coords.shape[0]),
+    ):
+        teacher_z = tex_encoder(fused_voxel.cuda())
+    with progress_heartbeat(
+        logger,
+        "align_teacher_latent",
+        every_sec=args.progress_interval,
+        id=record.safe_id,
+        source_tokens=int(teacher_z.coords.shape[0]),
+        target_tokens=int(original_tex_slat.coords.shape[0]),
+    ):
+        teacher_z = align_sparse_like(teacher_z, original_tex_slat, fill=original_tex_slat.feats)
 
-    weights = latent_weights_from_voxels(
-        mesh.coords.detach(),
-        voxel_conf.detach(),
-        teacher_z.coords[:, 1:].detach(),
-        resolution=args.resolution,
-        visible_weight=args.visible_weight,
-    )
-    np.savez_compressed(
-        os.path.join(out_dir, "loss_weights", args.teacher_latent_name, f"{record.safe_id}.npz"),
-        feats=weights.numpy().astype(np.float32),
-        coords=teacher_z.coords[:, 1:].detach().cpu().numpy().astype(np.uint8),
-    )
-    np.savez_compressed(
-        os.path.join(out_dir, "pbr_voxels", "fused", f"{record.safe_id}.npz"),
-        feats=fused_attrs.detach().cpu().numpy().astype(np.float32),
-        coords=mesh.coords.detach().cpu().numpy().astype(np.uint16),
-        confidence=voxel_conf.detach().cpu().numpy().astype(np.float32),
-    )
+    with progress_heartbeat(
+        logger,
+        "save_final_artifacts",
+        every_sec=args.progress_interval,
+        id=record.safe_id,
+        latent_path=final_latent_path,
+    ):
+        save_sparse(final_latent_path, teacher_z)
 
-    with open(os.path.join(out_dir, "teacher_views", record.safe_id, "views.json"), "w") as fp:
-        json.dump(view_records, fp, indent=2)
+        weights = latent_weights_from_voxels(
+            mesh.coords.detach(),
+            voxel_conf.detach(),
+            teacher_z.coords[:, 1:].detach(),
+            resolution=args.resolution,
+            visible_weight=args.visible_weight,
+        )
+        np.savez_compressed(
+            os.path.join(out_dir, "loss_weights", args.teacher_latent_name, f"{record.safe_id}.npz"),
+            feats=weights.numpy().astype(np.float32),
+            coords=teacher_z.coords[:, 1:].detach().cpu().numpy().astype(np.uint8),
+        )
+        np.savez_compressed(
+            os.path.join(out_dir, "pbr_voxels", "fused", f"{record.safe_id}.npz"),
+            feats=fused_attrs.detach().cpu().numpy().astype(np.float32),
+            coords=mesh.coords.detach().cpu().numpy().astype(np.uint16),
+            confidence=voxel_conf.detach().cpu().numpy().astype(np.float32),
+        )
+
+        with open(os.path.join(out_dir, "teacher_views", record.safe_id, "views.json"), "w") as fp:
+            json.dump(view_records, fp, indent=2)
 
     accepted_views = sum(1 for view in view_records if view["accepted"])
     coverage = float((voxel_conf[:, 0] > 1e-6).float().mean().item())
@@ -875,11 +1090,14 @@ def parse_args():
     parser.add_argument("--no_preprocess_image", action="store_true")
     parser.add_argument("--max_items", type=int, default=None)
     parser.add_argument("--keep_going", action="store_true", help="Log per-record failures and continue building the rest of the dataset.")
+    parser.add_argument("--progress_interval", type=float, default=30.0,
+                        help="Seconds between heartbeat messages while a long-running step is still active. Set <=0 to disable.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
 def main():
+    run_start = time.time()
     args = parse_args()
     ensure_dirs(args.output_dir, args.shape_latent_name, args.teacher_latent_name)
     logger = setup_logging(args.output_dir, args.verbose)
@@ -895,21 +1113,55 @@ def main():
         args.include_normal_reference,
         not args.no_source_reference,
     )
+    logger.info(
+        "run_config model_path=%s tex_encoder=%s teacher_model=%s teacher_quality=%s num_views=%s progress_interval=%.1fs",
+        args.model_path,
+        args.tex_encoder,
+        args.teacher_model,
+        args.teacher_quality,
+        args.num_views,
+        args.progress_interval,
+    )
 
     torch.set_grad_enabled(False)
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_path)
-    pipeline.cuda()
-    tex_encoder = models.from_pretrained(args.tex_encoder).eval().cuda()
+    with progress_heartbeat(
+        logger,
+        "load_pipeline",
+        every_sec=args.progress_interval,
+        model_path=args.model_path,
+    ):
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_path)
+    with progress_heartbeat(
+        logger,
+        "pipeline_cuda",
+        every_sec=args.progress_interval,
+        model_path=args.model_path,
+    ):
+        pipeline.cuda()
+    with progress_heartbeat(
+        logger,
+        "load_tex_encoder",
+        every_sec=args.progress_interval,
+        tex_encoder=args.tex_encoder,
+    ):
+        tex_encoder = models.from_pretrained(args.tex_encoder).eval().cuda()
 
-    renderer = PbrMeshRenderer({
-        "resolution": args.render_resolution,
-        "near": 1,
-        "far": 100,
-        "ssaa": 2,
-        "peel_layers": 8,
-        "return_geometry_buffers": True,
-    })
-    envmap = load_envmap()
+    with progress_heartbeat(
+        logger,
+        "init_renderer",
+        every_sec=args.progress_interval,
+        resolution=args.render_resolution,
+    ):
+        renderer = PbrMeshRenderer({
+            "resolution": args.render_resolution,
+            "near": 1,
+            "far": 100,
+            "ssaa": 2,
+            "peel_layers": 8,
+            "return_geometry_buffers": True,
+        })
+    with progress_heartbeat(logger, "load_envmap", every_sec=args.progress_interval, path="assets/hdri/forest.exr"):
+        envmap = load_envmap()
 
     rows = []
     for index, record in enumerate(records, 1):
@@ -917,9 +1169,29 @@ def main():
         row = process_record(record, pipeline, tex_encoder, renderer, envmap, args, logger)
         if row is not None:
             rows.append(row)
-            write_metadata(args.output_dir, rows)
-    write_metadata(args.output_dir, rows)
-    logger.info("run_done processed=%s output_dir=%s", len(rows), args.output_dir)
+            with progress_heartbeat(
+                logger,
+                "write_metadata",
+                every_sec=args.progress_interval,
+                records=len(rows),
+                output_dir=args.output_dir,
+            ):
+                write_metadata(args.output_dir, rows)
+    with progress_heartbeat(
+        logger,
+        "write_metadata_final",
+        every_sec=args.progress_interval,
+        records=len(rows),
+        output_dir=args.output_dir,
+    ):
+        write_metadata(args.output_dir, rows)
+    logger.info(
+        "run_done processed=%s total_inputs=%s output_dir=%s elapsed=%.1fs",
+        len(rows),
+        len(records),
+        args.output_dir,
+        time.time() - run_start,
+    )
 
 
 if __name__ == "__main__":

@@ -151,6 +151,9 @@ If too many views are rejected, loosen `--min_mask_iou` slightly or improve the 
 
 Builder observability:
 
+The builder writes progress logs to stdout and to `logs/build_teacher_dataset.log`. Long-running stages emit heartbeat lines
+every 30 seconds by default; adjust with `--progress_interval 10` or disable heartbeats with `--progress_interval 0`.
+
 ```sh
 tail -f datasets/trellis_teacher_512/logs/build_teacher_dataset.log
 cat datasets/trellis_teacher_512/logs/run_config.json
