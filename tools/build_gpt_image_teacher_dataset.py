@@ -169,10 +169,6 @@ def resolve_openai_api_key(args, require: bool = False) -> Optional[str]:
         raise RuntimeError(
             f"OpenAI API key from {source} contains whitespace. Re-export it without spaces or newlines."
         )
-    if key.endswith("%"):
-        raise RuntimeError(
-            f"OpenAI API key from {source} ends with '%', which usually means a shell prompt was copied with it."
-        )
     return key
 
 
@@ -371,14 +367,22 @@ def render_view(renderer, envmap, mesh, view):
 
 def teacher_prompt(args, has_normal_reference: bool, has_source_reference: bool) -> str:
     if args.teacher_prompt is not None:
-        return args.teacher_prompt
-    if has_normal_reference and has_source_reference:
-        return DEFAULT_TEACHER_PROMPT_WITH_NORMAL_AND_SOURCE
-    if has_normal_reference:
-        return DEFAULT_TEACHER_PROMPT_WITH_NORMAL
-    if has_source_reference:
-        return DEFAULT_TEACHER_PROMPT_WITH_SOURCE
-    return DEFAULT_TEACHER_PROMPT
+        prompt = args.teacher_prompt
+    elif has_normal_reference and has_source_reference:
+        prompt = DEFAULT_TEACHER_PROMPT_WITH_NORMAL_AND_SOURCE
+    elif has_normal_reference:
+        prompt = DEFAULT_TEACHER_PROMPT_WITH_NORMAL
+    elif has_source_reference:
+        prompt = DEFAULT_TEACHER_PROMPT_WITH_SOURCE
+    else:
+        prompt = DEFAULT_TEACHER_PROMPT
+
+    extra = getattr(args, "teacher_prompt_extra", None)
+    if extra:
+        extra = extra.strip()
+        if extra:
+            prompt = f"{prompt.rstrip()}\n\nAdditional instructions:\n{extra}"
+    return prompt
 
 
 def call_gpt_image_teacher(
@@ -1087,6 +1091,9 @@ def parse_args():
     parser.add_argument("--teacher_size", type=str, default="auto")
     parser.add_argument("--teacher_quality", type=str, default="high")
     parser.add_argument("--teacher_prompt", type=str, default=None)
+    parser.add_argument("--teacher_prompt_extra", "--teacher_prompt_instructions", dest="teacher_prompt_extra",
+                        type=str, default=None,
+                        help="Additional instructions appended to every GPT Image teacher prompt.")
     parser.add_argument("--include_normal_reference", action="store_true",
                         help="Send the rendered normal map with the albedo render to the GPT Image teacher.")
     parser.add_argument("--no_source_reference", action="store_true",

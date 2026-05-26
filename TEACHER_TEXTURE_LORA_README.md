@@ -49,7 +49,8 @@ python tools/build_gpt_image_teacher_dataset.py \
   --output_dir datasets/trellis_teacher_512 \
   --include_normal_reference \
   --teacher_model gpt-image-2 \
-  --teacher_quality high
+  --teacher_quality high \
+  --teacher_prompt_extra "Keep tiny logos, labels, and decal placement faithful to the source image."
 ```
 
 By default, each GPT Image teacher request includes the original source image that produced the TRELLIS asset. The teacher prompt tells GPT Image 2 to make the repaired visible albedo look more like that source image while preserving the generated render's silhouette, camera, geometry, and part layout. With `--include_normal_reference`, the request images are ordered as:
@@ -61,6 +62,8 @@ By default, each GPT Image teacher request includes the original source image th
 ```
 
 Without `--include_normal_reference`, the request includes the rendered albedo first and the source image second. Use `--no_source_reference` only for ablations where GPT Image 2 should repair the generated albedo without seeing the original input image.
+
+Use `--teacher_prompt_extra` to append run-specific guidance to every default teacher prompt while keeping the source/normal-reference wording selected automatically. `--teacher_prompt_instructions` is accepted as an alias. `--teacher_prompt` still replaces the base prompt, and the extra instructions are appended after that replacement if both are provided.
 
 What the builder writes:
 
